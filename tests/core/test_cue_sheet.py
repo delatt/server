@@ -31,10 +31,10 @@ def test_parse_basic_cue_sheet() -> None:
     result = parse_cue_sheet(SAMPLE_CUE)
 
     assert result.title == "The Album"
-    assert result.performer == "The Artist"
+    assert result.performers == ["The Artist"]
     assert result.file_path == "album.flac"
     assert result.date == "1995"
-    assert result.genre == "Rock"
+    assert result.genres == ["Rock"]
     assert result.musicbrainz_albumid == "4591f427-4632-474c-9f2d-b4f009e53096"
     assert len(result.tracks) == 3
 
@@ -46,14 +46,15 @@ def test_parse_track_metadata() -> None:
     track1 = result.tracks[0]
     assert track1.number == 1
     assert track1.title == "First Track"
-    assert track1.performer == "The Artist"
-    assert track1.isrc == "USRC17607839"
-    assert track1.musicbrainz_trackid == "d5c4a1b0-1234-5678-9abc-def012345678"
+    assert track1.performers == ["The Artist"]
+    assert track1.isrcs == ["USRC17607839"]
+    # REM MUSICBRAINZ_TRACKID carries the recording MBID (Picard legacy naming)
+    assert track1.musicbrainz_recordingid == "d5c4a1b0-1234-5678-9abc-def012345678"
 
     track2 = result.tracks[1]
     assert track2.number == 2
     assert track2.title == "Second Track"
-    assert track2.performer == "Featured Artist"
+    assert track2.performers == ["Featured Artist"]
 
 
 def test_parse_timestamps() -> None:
@@ -120,8 +121,8 @@ FILE "album.flac" WAVE
     INDEX 01 00:00:00
 """
     result = parse_cue_sheet(cue)
-    assert result.performer is None
-    assert result.tracks[0].performer is None
+    assert result.performers == []
+    assert result.tracks[0].performers == []
     assert result.tracks[0].title == "Song One"
 
 
@@ -143,9 +144,100 @@ FILE "album.flac" WAVE
   TRACK 01 AUDIO
     TITLE "Track One"
     REM MUSICBRAINZ_TRACKID abc-123
-    REM ISRC GBAYE0000351
+    REM MUSICBRAINZ_RELEASETRACKID zzz-999
+    ISRC GBAYE0000351
     INDEX 01 00:00:00
 """
     result = parse_cue_sheet(cue)
-    assert result.tracks[0].musicbrainz_trackid == "abc-123"
-    assert result.tracks[0].isrc == "GBAYE0000351"
+    # both MUSICBRAINZ_TRACKID and MUSICBRAINZ_RECORDINGID land in recordingid
+    assert result.tracks[0].musicbrainz_recordingid == "abc-123"
+    assert result.tracks[0].musicbrainz_releasetrackid == "zzz-999"
+    assert result.tracks[0].isrcs == ["GBAYE0000351"]
+
+
+def test_recordingid_alias_overrides_legacy_trackid() -> None:
+    """When both forms are present, the later line wins (same field)."""
+    cue = """\
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "T1"
+    REM MUSICBRAINZ_TRACKID legacy-value
+    REM MUSICBRAINZ_RECORDINGID modern-value
+    INDEX 01 00:00:00
+"""
+    result = parse_cue_sheet(cue)
+    assert result.tracks[0].musicbrainz_recordingid == "modern-value"
+
+
+def test_multi_line_vorbis_style_fields() -> None:
+    """Repeated PERFORMER / ISRC / REM lines accumulate into lists."""
+    cue = """\
+PERFORMER "Label Artist A"
+PERFORMER "Label Artist B"
+REM GENRE "Rock"
+REM GENRE "Pop"
+REM MUSICBRAINZ_ALBUMARTISTID aa-1
+REM MUSICBRAINZ_ALBUMARTISTID aa-2
+REM ALBUMARTISTSORT "Artist A, Label"
+REM ALBUMARTISTSORT "Artist B, Label"
+REM RELEASETYPE album
+REM RELEASETYPE compilation
+TITLE "Album"
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "T1"
+    PERFORMER "Duo Member One"
+    PERFORMER "Duo Member Two"
+    ISRC USRC0000001
+    ISRC USRC0000002
+    REM ARTISTSORT "Member One, Duo"
+    REM ARTISTSORT "Member Two, Duo"
+    REM MUSICBRAINZ_ARTISTID mb-1
+    REM MUSICBRAINZ_ARTISTID mb-2
+    REM GENRE "Folk"
+    REM GENRE "Blues"
+    INDEX 01 00:00:00
+"""
+    result = parse_cue_sheet(cue)
+    assert result.performers == ["Label Artist A", "Label Artist B"]
+    assert result.genres == ["Rock", "Pop"]
+    assert result.musicbrainz_albumartistids == ["aa-1", "aa-2"]
+    assert result.album_artist_sort_names == ["Artist A, Label", "Artist B, Label"]
+    assert result.album_types == ["album", "compilation"]
+
+    track = result.tracks[0]
+    assert track.performers == ["Duo Member One", "Duo Member Two"]
+    assert track.isrcs == ["USRC0000001", "USRC0000002"]
+    assert track.artist_sort_names == ["Member One, Duo", "Member Two, Duo"]
+    assert track.musicbrainz_artistids == ["mb-1", "mb-2"]
+    assert track.genres == ["Folk", "Blues"]
+
+
+def test_additional_single_value_rem_fields() -> None:
+    """REM TITLESORT / COPYRIGHT / GROUPING / COMMENT / ITUNESADVISORY + CATALOG."""
+    cue = """\
+CATALOG 0123456789012
+TITLE "Album"
+REM ALBUMSORT "Album, The"
+REM MUSICBRAINZ_RELEASEGROUPID rg-uuid
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Song, The"
+    REM TITLESORT "Song, The"
+    REM COPYRIGHT "(c) 2024 Label"
+    REM GROUPING "Movement I"
+    REM COMMENT "Live at Wembley"
+    REM ITUNESADVISORY 1
+    INDEX 01 00:00:00
+"""
+    result = parse_cue_sheet(cue)
+    assert result.sort_title == "Album, The"
+    assert result.barcode == "0123456789012"
+    assert result.musicbrainz_releasegroupid == "rg-uuid"
+
+    track = result.tracks[0]
+    assert track.sort_name == "Song, The"
+    assert track.copyright == "(c) 2024 Label"
+    assert track.grouping == "Movement I"
+    assert track.comment == "Live at Wembley"
+    assert track.explicit is True

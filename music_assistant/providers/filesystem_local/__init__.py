@@ -1026,6 +1026,14 @@ class LocalFileSystemProvider(MusicProvider):
             msg = f"Media file not found: {item_id}"
             raise MediaNotFoundError(msg)
 
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes, None]:
+        """Return the custom audio stream for the provider item."""
+        # only CUE-derived tracks use StreamType.CUSTOM in this provider
+        async for chunk in self._cue.get_audio_stream(streamdetails, seek_position):
+            yield chunk
+
     async def resolve_image(self, path: str) -> str | bytes:
         """
         Resolve an image from an image path.

@@ -11,14 +11,12 @@ A CUE sheet describes multiple logical tracks within a single audio file
 
 from __future__ import annotations
 
-import asyncio
 import os
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-import aiofiles
 from music_assistant_models.enums import (
     ContentType,
     ExternalID,
@@ -42,9 +40,10 @@ from music_assistant_models.streamdetails import StreamDetails
 from music_assistant.helpers.cue_sheet import CueSheet, CueTrack, parse_cue_sheet
 from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.helpers.tags import AudioTags, async_parse_tags
+from music_assistant.helpers.util import detect_charset
 
 from .constants import TRACK_EXTENSIONS
-from .helpers import FileSystemItem, get_relative_path
+from .helpers import FileSystemItem
 
 if TYPE_CHECKING:
     from . import LocalFileSystemProvider
@@ -60,9 +59,9 @@ class _TrackBuildContext:
     disc_number: int
     date_added: datetime | None
     embedded_image: MediaItemImage | None
-    track_genres: set[str] | None
+    track_genres: set[str] | None  # fallback genres from the audio file
     album: Album | None
-    album_performer: str | None
+    album_performers: tuple[str, ...]  # sheet-level PERFORMER values, fallback for track artists
 
 
 def make_cue_track_id(cue_relative_path: str, track_number: int) -> str:
@@ -90,21 +89,17 @@ class CueSheetHandler:
         """
         self.provider = provider
 
-    async def read_cue_file(self, absolute_path: str) -> str:
+    async def read_cue_file(self, cue_item: FileSystemItem) -> str:
         """
-        Read CUE file content.
+        Read CUE file content, decoded with the detected charset.
 
-        :param absolute_path: Absolute path to the CUE file.
+        :param cue_item: The CUE file's FileSystemItem.
         """
-        for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
-            try:
-                async with aiofiles.open(absolute_path, encoding=encoding) as f:
-                    content: str = await f.read()
-                    return content
-            except UnicodeDecodeError:
-                continue
-        msg = f"Unable to decode CUE file: {absolute_path}"
-        raise InvalidDataError(msg)
+        # route through provider._read_file so WebDAV (and any future non-mounted
+        # filesystem provider) uses its own transport instead of aiofiles
+        raw = await self.provider._read_file(cue_item.relative_path)
+        encoding = await detect_charset(raw)
+        return raw.decode(encoding, errors="replace")
 
     async def load_cue_sheet(self, cue_item: FileSystemItem) -> CueSheet:
         """
@@ -112,7 +107,7 @@ class CueSheetHandler:
 
         :param cue_item: The CUE file's FileSystemItem.
         """
-        content = await self.read_cue_file(cue_item.absolute_path)
+        content = await self.read_cue_file(cue_item)
         return parse_cue_sheet(content)
 
     @staticmethod
@@ -123,9 +118,8 @@ class CueSheetHandler:
         :param audio_path: Path to the audio file (used for extension fallback).
         :param tags: Parsed audio tags.
         """
-        ext = audio_path.rsplit(".", 1)[-1] if "." in audio_path else None
         return AudioFormat(
-            content_type=ContentType.try_parse(ext or tags.format),
+            content_type=ContentType.try_parse(audio_path.rsplit(".", 1)[-1] or tags.format),
             sample_rate=tags.sample_rate,
             bit_depth=tags.bits_per_sample,
             channels=tags.channels,
@@ -134,59 +128,66 @@ class CueSheetHandler:
 
     async def find_audio_file(self, cue_item: FileSystemItem, cue_sheet: CueSheet) -> str | None:
         """
-        Find the audio file referenced by a CUE sheet.
+        Locate the audio file referenced by a CUE sheet.
+
+        Returns the provider-relative path of the audio file, or ``None`` if it
+        cannot be located. Routing through ``provider.exists`` keeps this working
+        for every filesystem provider (local, SMB/NFS mounts, WebDAV).
 
         :param cue_item: The CUE file's FileSystemItem.
         :param cue_sheet: The parsed CUE sheet data.
         """
+        cue_dir = os.path.dirname(cue_item.relative_path)
 
-        def _locate() -> str | None:
-            cue_dir = os.path.dirname(cue_item.absolute_path)
+        def _join(name: str) -> str:
+            return os.path.join(cue_dir, name) if cue_dir else name
 
-            # 1. try the filename from the CUE FILE command
-            if cue_sheet.file_path:
-                candidate = os.path.join(cue_dir, cue_sheet.file_path)
-                if os.path.isfile(candidate):
-                    return candidate
+        # 1. try the filename from the CUE FILE command
+        if cue_sheet.file_path:
+            candidate = _join(cue_sheet.file_path)
+            if await self.provider.exists(candidate):
+                return candidate
 
-            # 2. same-name matching: album.cue -> album.{flac,mp3,...}
-            cue_stem = cue_item.filename.rsplit(".", 1)[0]
-            for ext in TRACK_EXTENSIONS:
-                candidate = os.path.join(cue_dir, f"{cue_stem}.{ext}")
-                if os.path.isfile(candidate):
-                    return candidate
+        # 2. same-name matching: album.cue -> album.{flac,mp3,...}
+        cue_stem = cue_item.filename.rsplit(".", 1)[0]
+        for ext in TRACK_EXTENSIONS:
+            candidate = _join(f"{cue_stem}.{ext}")
+            if await self.provider.exists(candidate):
+                return candidate
 
-            # 3. fall back to the only audio file in the same directory, if any
-            audio_files: list[str] = []
-            try:
-                for entry in os.scandir(cue_dir):
-                    if not entry.is_file() or "." not in entry.name:
-                        continue
-                    if entry.name.rsplit(".", 1)[1].lower() in TRACK_EXTENSIONS:
-                        audio_files.append(entry.path)
-            except OSError as err:
-                self.provider.logger.warning("Unable to scan CUE directory %s: %s", cue_dir, err)
-                return None
-            if len(audio_files) == 1:
-                return audio_files[0]
-            return None
-
-        return await asyncio.to_thread(_locate)
+        return None
 
     @staticmethod
     def _apply_cue_overrides(tags: AudioTags, cue_sheet: CueSheet) -> None:
         """Overwrite album-level audio tags with values from the CUE sheet."""
         if cue_sheet.title:
             tags.tags["album"] = cue_sheet.title
-        if cue_sheet.performer:
-            tags.tags.pop("albumartists", None)
-            tags.tags["albumartist"] = cue_sheet.performer
+        if cue_sheet.sort_title:
+            tags.tags["albumsort"] = cue_sheet.sort_title
+        if cue_sheet.performers:
+            # use the plural form so AudioTags.album_artists picks up every value —
+            # tags.tags is typed str-valued but holds list[str] for Vorbis-style multi
+            # (see how parse helpers populate it in music_assistant.helpers.tags)
+            tags.tags.pop("albumartist", None)
+            tags.tags["albumartists"] = list(cue_sheet.performers)  # type: ignore[assignment]
+        if cue_sheet.album_artist_sort_names:
+            tags.tags["albumartistsort"] = ";".join(cue_sheet.album_artist_sort_names)
+        if cue_sheet.musicbrainz_albumartistids:
+            tags.tags["musicbrainzalbumartistid"] = ";".join(cue_sheet.musicbrainz_albumartistids)
         if cue_sheet.date:
             tags.tags["date"] = cue_sheet.date
-        if cue_sheet.genre:
-            tags.tags["genre"] = cue_sheet.genre
+        if cue_sheet.genres:
+            # AudioTags.genres splits on ";" so we join multi-line values that way
+            tags.tags["genre"] = ";".join(cue_sheet.genres)
+        if cue_sheet.album_types:
+            # album_type reads "releasetype" as a single string and substring-matches
+            tags.tags["releasetype"] = " ".join(cue_sheet.album_types)
+        if cue_sheet.barcode:
+            tags.tags["barcode"] = cue_sheet.barcode
         if cue_sheet.musicbrainz_albumid:
             tags.tags["musicbrainzalbumid"] = cue_sheet.musicbrainz_albumid
+        if cue_sheet.musicbrainz_releasegroupid:
+            tags.tags["musicbrainzreleasegroupid"] = cue_sheet.musicbrainz_releasegroupid
 
     async def _build_track(
         self,
@@ -199,16 +200,34 @@ class CueSheetHandler:
         provider = self.provider
         track_id = make_cue_track_id(cue_item.relative_path, cue_track.number)
 
-        # track artist: CUE track PERFORMER → CUE top-level PERFORMER → none
+        # track artist(s): per-track PERFORMER wins, falling back to sheet-level PERFORMER.
+        # Multi-artist is expressed as multiple PERFORMER lines (Vorbis convention) —
+        # we deliberately do not split a single PERFORMER value on delimiters since band
+        # names like "AC/DC" would be mangled.
+        performer_names = cue_track.performers or list(ctx.album_performers)
         track_artists: UniqueList[Artist | ItemMapping] = UniqueList()
-        if track_performer := cue_track.performer or ctx.album_performer:
-            if artist := await provider._parse_artist(name=track_performer):
+        for idx, artist_name in enumerate(performer_names):
+            artist = await provider._parse_artist(
+                name=artist_name,
+                sort_name=(
+                    cue_track.artist_sort_names[idx]
+                    if idx < len(cue_track.artist_sort_names)
+                    else None
+                ),
+                mbid=(
+                    cue_track.musicbrainz_artistids[idx]
+                    if idx < len(cue_track.musicbrainz_artistids)
+                    else None
+                ),
+            )
+            if artist:
                 track_artists.append(artist)
 
         track = Track(
             item_id=track_id,
             provider=provider.instance_id,
             name=cue_track.title or f"Track {cue_track.number}",
+            sort_name=cue_track.sort_name,
             provider_mappings={
                 ProviderMapping(
                     item_id=track_id,
@@ -229,14 +248,28 @@ class CueSheetHandler:
             track.artists = track_artists
         if ctx.album:
             track.album = ctx.album
-        if cue_track.isrc:
-            track.external_ids.add((ExternalID.ISRC, cue_track.isrc))
-        if cue_track.musicbrainz_trackid:
-            track.external_ids.add((ExternalID.MB_RECORDING, cue_track.musicbrainz_trackid))
+        for isrc in cue_track.isrcs:
+            track.external_ids.add((ExternalID.ISRC, isrc))
+        if cue_track.musicbrainz_recordingid:
+            # the setter runs UUID validation and keeps external_ids in sync
+            track.mbid = cue_track.musicbrainz_recordingid
+        if cue_track.musicbrainz_releasetrackid:
+            track.external_ids.add((ExternalID.MB_TRACK, cue_track.musicbrainz_releasetrackid))
         if ctx.embedded_image is not None:
             track.metadata.images = UniqueList([ctx.embedded_image])
-        if ctx.track_genres is not None:
+        if cue_track.genres:
+            # per-track REM GENRE wins over the shared audio-file/album genres
+            track.metadata.genres = set(cue_track.genres)
+        elif ctx.track_genres is not None:
             track.metadata.genres = ctx.track_genres
+        if cue_track.copyright:
+            track.metadata.copyright = cue_track.copyright
+        if cue_track.grouping:
+            track.metadata.grouping = cue_track.grouping
+        if cue_track.comment:
+            track.metadata.description = cue_track.comment
+        if cue_track.explicit is not None:
+            track.metadata.explicit = cue_track.explicit
         return track
 
     async def parse_tracks(self, cue_item: FileSystemItem) -> list[Track]:
@@ -250,24 +283,21 @@ class CueSheetHandler:
         cue_sheet = await self.load_cue_sheet(cue_item)
 
         if not cue_sheet.tracks:
-            logger.warning("CUE sheet has no tracks: %s", cue_item.relative_path)
-            return []
+            msg = f"CUE sheet has no tracks: {cue_item.relative_path}"
+            raise InvalidDataError(msg)
 
-        audio_path = await self.find_audio_file(cue_item, cue_sheet)
-        if audio_path is None:
-            logger.error("Audio file not found for CUE sheet: %s", cue_item.relative_path)
-            return []
+        audio_relative_path = await self.find_audio_file(cue_item, cue_sheet)
+        if audio_relative_path is None:
+            msg = f"Audio file not found for CUE sheet: {cue_item.relative_path}"
+            raise MediaNotFoundError(msg)
 
-        tags = await async_parse_tags(audio_path)
+        audio_item = await provider.resolve(audio_relative_path)
+        tags = await async_parse_tags(audio_item.absolute_path)
         total_duration = tags.duration or 0.0
         if total_duration <= 0:
-            logger.error(
-                "Could not determine duration for audio file of CUE sheet: %s",
-                cue_item.relative_path,
-            )
-            return []
+            msg = f"Could not determine duration for audio file of CUE sheet: {cue_item.relative_path}"
+            raise InvalidDataError(msg)
 
-        audio_relative_path = get_relative_path(provider.base_path, audio_path)
         self._apply_cue_overrides(tags, cue_sheet)
 
         album: Album | None = None
@@ -299,7 +329,7 @@ class CueSheetHandler:
             album.metadata.images = UniqueList([embedded_image])
 
         ctx = _TrackBuildContext(
-            audio_format=self._audio_format_from_tags(audio_path, tags),
+            audio_format=self._audio_format_from_tags(audio_relative_path, tags),
             # honor audio file's DISCNUMBER (CUE does not carry disc info); defaults to 1
             disc_number=tags.disc or 1,
             date_added=(
@@ -308,7 +338,7 @@ class CueSheetHandler:
             embedded_image=embedded_image,
             track_genres=set(tags.genres) if tags.genres else None,
             album=album,
-            album_performer=cue_sheet.performer,
+            album_performers=tuple(cue_sheet.performers),
         )
 
         sorted_tracks = sorted(cue_sheet.tracks, key=lambda t: t.start_position)
@@ -351,60 +381,56 @@ class CueSheetHandler:
             raise InvalidDataError(msg)
         cue_path, track_number = parsed
 
-        cue_item = await self.provider.resolve(cue_path)
-        cue_sheet = await self.load_cue_sheet(cue_item)
-
-        audio_path = await self.find_audio_file(cue_item, cue_sheet)
-        if audio_path is None:
-            msg = f"Audio file not found for CUE sheet: {cue_path}"
+        # audio format + duration were persisted at sync time; reuse them here
+        provider = self.provider
+        library_track = await provider.mass.music.tracks.get_library_item_by_prov_id(
+            item_id, provider.instance_id
+        )
+        if library_track is None:
+            msg = f"CUE track not in library: {item_id}"
             raise MediaNotFoundError(msg)
+        prov_mapping = next(x for x in library_track.provider_mappings if x.item_id == item_id)
+        original_format = prov_mapping.audio_format
 
-        tags = await async_parse_tags(audio_path)
-        total_duration = tags.duration or 0.0
-
+        # the CUE parse only gives us the track's start offset and the audio filename
+        cue_item = await provider.resolve(cue_path)
+        cue_sheet = await self.load_cue_sheet(cue_item)
         cue_track = next((t for t in cue_sheet.tracks if t.number == track_number), None)
         if cue_track is None:
             msg = f"Track {track_number} not found in CUE sheet: {cue_path}"
             raise MediaNotFoundError(msg)
 
-        start_seconds = cue_track.start_position
-        sorted_tracks = sorted(cue_sheet.tracks, key=lambda t: t.start_position)
-        track_idx = next(i for i, t in enumerate(sorted_tracks) if t.number == track_number)
-        if track_idx + 1 < len(sorted_tracks):
-            end_seconds = sorted_tracks[track_idx + 1].start_position
-        else:
-            end_seconds = total_duration
-        duration = end_seconds - start_seconds
-
-        # store original audio format info for get_audio_stream
-        original_format = self._audio_format_from_tags(audio_path, tags)
-
-        # output format: PCM since we use FFmpeg to extract the segment
-        output_format = AudioFormat(
-            content_type=ContentType.PCM_F32LE,
-            sample_rate=tags.sample_rate,
-            bit_depth=32,
-            channels=tags.channels,
-        )
+        audio_relative_path = await self.find_audio_file(cue_item, cue_sheet)
+        if audio_relative_path is None:
+            msg = f"Audio file not found for CUE sheet: {cue_path}"
+            raise MediaNotFoundError(msg)
 
         # StreamType.CUSTOM is required here: a CUE track is a segment of a larger
         # file and needs -ss/-t applied relative to the track's base offset. Core
         # appends its own -ss for user seeks after streamdetails.extra_input_args,
         # and a second input -ss overrides the first — so LOCAL_FILE with a base
         # offset cannot coexist with user seeking under the current core API.
+        output_format = AudioFormat(
+            content_type=ContentType.PCM_F32LE,
+            sample_rate=original_format.sample_rate,
+            bit_depth=32,
+            channels=original_format.channels,
+        )
+        # store the relative path so get_audio_stream can re-resolve at stream time —
+        # this keeps WebDAV's authenticated URLs fresh and avoids leaking credentials
+        # into persisted StreamDetails
         return StreamDetails(
-            provider=self.provider.instance_id,
+            provider=provider.instance_id,
             item_id=item_id,
             audio_format=output_format,
             media_type=MediaType.TRACK,
             stream_type=StreamType.CUSTOM,
-            duration=round(duration),
+            duration=library_track.duration,
             can_seek=True,
             allow_seek=True,
             data={
-                "audio_path": audio_path,
-                "start_seconds": start_seconds,
-                "track_duration": duration,
+                "audio_relative_path": audio_relative_path,
+                "start_seconds": cue_track.start_position,
                 "original_format": original_format.to_dict(),
             },
         )
@@ -418,24 +444,24 @@ class CueSheetHandler:
         :param streamdetails: Streamdetails previously built by :meth:`get_stream_details`.
         :param seek_position: Position (seconds) within the track to start from.
         """
-        if not streamdetails.data or "audio_path" not in streamdetails.data:
-            msg = f"Invalid CUE track stream details: {streamdetails.item_id}"
-            raise InvalidDataError(msg)
-
-        audio_path: str = streamdetails.data["audio_path"]
+        # streamdetails here was built by get_stream_details above, so data and
+        # duration are guaranteed populated — the assertions exist to narrow types
+        assert streamdetails.data is not None
+        assert streamdetails.duration is not None
+        audio_relative_path: str = streamdetails.data["audio_relative_path"]
         base_start: float = streamdetails.data["start_seconds"]
-        track_duration: float = streamdetails.data["track_duration"]
         original_format = AudioFormat.from_dict(streamdetails.data["original_format"])
 
         # actual seek position within the full audio file
         actual_seek = base_start + seek_position
-        remaining_duration = track_duration - seek_position
-
+        remaining_duration = streamdetails.duration - seek_position
         if remaining_duration <= 0:
             return
 
+        # re-resolve to get a current absolute path (e.g. fresh auth for WebDAV)
+        audio_item = await self.provider.resolve(audio_relative_path)
         async for chunk in get_ffmpeg_stream(
-            audio_input=audio_path,
+            audio_input=audio_item.absolute_path,
             input_format=original_format,
             output_format=streamdetails.audio_format,
             extra_input_args=["-ss", str(actual_seek), "-t", str(remaining_duration)],

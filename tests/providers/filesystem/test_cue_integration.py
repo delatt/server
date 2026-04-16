@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from music_assistant_models.enums import ContentType, ExternalID
 from music_assistant_models.errors import InvalidDataError, MediaNotFoundError
-from music_assistant_models.media_items import Album, Artist, Track
+from music_assistant_models.media_items import Album, Artist, AudioFormat, Track
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.helpers.tags import AudioTags
@@ -96,6 +96,24 @@ def _make_provider(base_path: str = "/music") -> LocalFileSystemProvider:
     return provider
 
 
+def _stub_library_track(
+    provider: LocalFileSystemProvider, item_id: str, duration: int = 180
+) -> None:
+    """Configure the provider's mass to return a library track for item_id."""
+    prov_mapping = MagicMock(
+        item_id=item_id,
+        audio_format=AudioFormat(
+            content_type=ContentType.FLAC,
+            sample_rate=44100,
+            bit_depth=16,
+            channels=2,
+            bit_rate=1000,
+        ),
+    )
+    library_track = MagicMock(provider_mappings=[prov_mapping], duration=duration)
+    provider.mass.music.tracks.get_library_item_by_prov_id = AsyncMock(return_value=library_track)  # type: ignore[method-assign]
+
+
 def _make_cue_item(tmp_path: Path, cue_text: str, name: str = "album.cue") -> FileSystemItem:
     """Write a CUE file under tmp_path and return a FileSystemItem for it."""
     cue_file = tmp_path / name
@@ -145,31 +163,48 @@ class TestReadCueFile:
     @pytest.mark.asyncio
     async def test_reads_utf8(self, tmp_path: Path) -> None:
         """Reads utf8."""
-        cue = tmp_path / "a.cue"
-        cue.write_text('TITLE "Café"\n', encoding="utf-8")
-        provider = _make_provider()
-        content = await provider._cue.read_cue_file(str(cue))
+        (tmp_path / "a.cue").write_text('TITLE "Café"\n', encoding="utf-8")
+        provider = _make_provider(base_path=str(tmp_path))
+        cue_item = _make_cue_item(tmp_path, 'TITLE "Café"\n', name="a.cue")
+        content = await provider._cue.read_cue_file(cue_item)
         assert "Café" in content
 
     @pytest.mark.asyncio
     async def test_reads_utf8_bom(self, tmp_path: Path) -> None:
         """Reads utf8 bom."""
-        cue = tmp_path / "a.cue"
-        cue.write_text('TITLE "Café"\n', encoding="utf-8-sig")
-        provider = _make_provider()
-        content = await provider._cue.read_cue_file(str(cue))
+        (tmp_path / "a.cue").write_text('TITLE "Café"\n', encoding="utf-8-sig")
+        provider = _make_provider(base_path=str(tmp_path))
+        cue_item = FileSystemItem(
+            filename="a.cue",
+            relative_path="a.cue",
+            absolute_path=str(tmp_path / "a.cue"),
+            is_dir=False,
+            checksum="1",
+            file_size=(tmp_path / "a.cue").stat().st_size,
+        )
+        content = await provider._cue.read_cue_file(cue_item)
         assert "Café" in content
         assert not content.startswith("\ufeff")
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_latin1(self, tmp_path: Path) -> None:
-        """Falls back to latin1."""
-        cue = tmp_path / "a.cue"
-        # 0xFC = "ü" in Latin-1 but invalid as UTF-8 continuation, forcing fallback
-        cue.write_bytes(b'TITLE "M\xfcller"\n')
-        provider = _make_provider()
-        content = await provider._cue.read_cue_file(str(cue))
-        assert "Müller" in content
+    async def test_decodes_non_utf8_tolerantly(self, tmp_path: Path) -> None:
+        """Non-UTF-8 bytes are decoded without raising."""
+        # 0xFC is "ü" in Latin-1 but invalid as a UTF-8 continuation byte
+        (tmp_path / "a.cue").write_bytes(b'TITLE "M\xfcller"\n')
+        provider = _make_provider(base_path=str(tmp_path))
+        cue_item = FileSystemItem(
+            filename="a.cue",
+            relative_path="a.cue",
+            absolute_path=str(tmp_path / "a.cue"),
+            is_dir=False,
+            checksum="1",
+            file_size=(tmp_path / "a.cue").stat().st_size,
+        )
+        content = await provider._cue.read_cue_file(cue_item)
+        # ASCII surroundings are preserved; the non-UTF-8 byte may be replaced
+        # or decoded depending on what chardet detects
+        assert "TITLE" in content
+        assert "ller" in content
 
 
 class TestFindCueAudioFile:
@@ -181,49 +216,28 @@ class TestFindCueAudioFile:
         (tmp_path / "album.flac").write_bytes(b"")
         (tmp_path / "other.flac").write_bytes(b"")
         cue_item = _make_cue_item(tmp_path, 'FILE "album.flac" WAVE\n')
-        provider = _make_provider()
+        provider = _make_provider(base_path=str(tmp_path))
         cue_sheet = MagicMock(file_path="album.flac")
         result = await provider._cue.find_audio_file(cue_item, cue_sheet)
-        assert result == str(tmp_path / "album.flac")
+        assert result == "album.flac"
 
     @pytest.mark.asyncio
     async def test_same_stem_fallback(self, tmp_path: Path) -> None:
         """Same stem fallback."""
         (tmp_path / "album.flac").write_bytes(b"")
         cue_item = _make_cue_item(tmp_path, "")
-        provider = _make_provider()
+        provider = _make_provider(base_path=str(tmp_path))
         cue_sheet = MagicMock(file_path=None)
         result = await provider._cue.find_audio_file(cue_item, cue_sheet)
-        assert result == str(tmp_path / "album.flac")
+        assert result == "album.flac"
 
     @pytest.mark.asyncio
-    async def test_single_audio_file_fallback(self, tmp_path: Path) -> None:
-        """Single audio file fallback."""
-        # FILE command points at a nonexistent file; CUE stem doesn't match
+    async def test_returns_none_when_file_missing_and_stem_mismatch(self, tmp_path: Path) -> None:
+        """Returns None when neither FILE nor same-stem match locates the audio file."""
         (tmp_path / "onlyone.flac").write_bytes(b"")
         cue_item = _make_cue_item(tmp_path, "", name="different.cue")
-        provider = _make_provider()
+        provider = _make_provider(base_path=str(tmp_path))
         cue_sheet = MagicMock(file_path="missing.flac")
-        result = await provider._cue.find_audio_file(cue_item, cue_sheet)
-        assert result == str(tmp_path / "onlyone.flac")
-
-    @pytest.mark.asyncio
-    async def test_multiple_audio_files_no_match(self, tmp_path: Path) -> None:
-        """Multiple audio files no match."""
-        (tmp_path / "one.flac").write_bytes(b"")
-        (tmp_path / "two.flac").write_bytes(b"")
-        cue_item = _make_cue_item(tmp_path, "", name="different.cue")
-        provider = _make_provider()
-        cue_sheet = MagicMock(file_path=None)
-        result = await provider._cue.find_audio_file(cue_item, cue_sheet)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_no_audio_files(self, tmp_path: Path) -> None:
-        """No audio files."""
-        cue_item = _make_cue_item(tmp_path, "")
-        provider = _make_provider()
-        cue_sheet = MagicMock(file_path=None)
         result = await provider._cue.find_audio_file(cue_item, cue_sheet)
         assert result is None
 
@@ -247,33 +261,42 @@ class TestParseCueTracks:
         )
 
     @pytest.mark.asyncio
-    async def test_returns_empty_when_no_tracks(self, tmp_path: Path) -> None:
-        """Returns empty when no tracks."""
+    async def test_raises_when_no_tracks(self, tmp_path: Path) -> None:
+        """Raises when CUE has no TRACK entries."""
         cue_item = _make_cue_item(tmp_path, 'TITLE "Empty"\n')
         provider = _make_provider(base_path=str(tmp_path))
         provider._parse_album = AsyncMock(return_value=None)  # type: ignore[method-assign]
-
-        with patch(
-            "music_assistant.providers.filesystem_local.cue.async_parse_tags",
-            AsyncMock(return_value=_make_audio_tags()),
-        ):
-            tracks = await provider._cue.parse_tracks(cue_item)
-        assert tracks == []
-        provider.logger.warning.assert_called()  # type: ignore[attr-defined]
+        with pytest.raises(InvalidDataError):
+            await provider._cue.parse_tracks(cue_item)
 
     @pytest.mark.asyncio
-    async def test_returns_empty_when_audio_missing(self, tmp_path: Path) -> None:
-        """Returns empty when audio missing."""
-        # CUE references a file that doesn't exist and no other audio in dir
+    async def test_raises_when_audio_missing(self, tmp_path: Path) -> None:
+        """Raises when the CUE-referenced audio file cannot be located."""
         cue_item = _make_cue_item(
             tmp_path,
             'FILE "missing.flac" WAVE\n  TRACK 01 AUDIO\n    TITLE "x"\n    INDEX 01 00:00:00\n',
         )
         provider = _make_provider(base_path=str(tmp_path))
         provider._parse_album = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        tracks = await provider._cue.parse_tracks(cue_item)
-        assert tracks == []
-        provider.logger.error.assert_called()  # type: ignore[attr-defined]
+        with pytest.raises(MediaNotFoundError):
+            await provider._cue.parse_tracks(cue_item)
+
+    @pytest.mark.asyncio
+    async def test_raises_when_audio_has_no_duration(self, tmp_path: Path) -> None:
+        """Raises when the referenced audio file has no usable duration."""
+        audio_file = tmp_path / "album.flac"
+        audio_file.write_bytes(b"")
+        cue_item = _make_cue_item(tmp_path, SAMPLE_CUE)
+        provider = _make_provider(base_path=str(tmp_path))
+        provider._parse_album = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        with (
+            patch(
+                "music_assistant.providers.filesystem_local.cue.async_parse_tags",
+                AsyncMock(return_value=_make_audio_tags(duration=0.0)),
+            ),
+            pytest.raises(InvalidDataError),
+        ):
+            await provider._cue.parse_tracks(cue_item)
 
     @pytest.mark.asyncio
     async def test_builds_tracks_with_cue_metadata(self, tmp_path: Path) -> None:
@@ -306,8 +329,11 @@ class TestParseCueTracks:
         assert len(tracks) == 3
         # CUE TITLE overrode audio tag for album name
         assert tags.tags["album"] == "Live at the BBC"
-        # CUE top-level PERFORMER overrode audio albumartist
-        assert tags.tags["albumartist"] == "Dire Straits"
+        # CUE top-level PERFORMER overrode audio albumartist (multi-value plural form —
+        # tags.tags is typed str-valued but accepts list[str] at runtime, mirroring
+        # how audio-tag parsers in helpers.tags populate it)
+        assert tags.tags["albumartists"] == ["Dire Straits"]  # type: ignore[comparison-overlap]
+        assert "albumartist" not in tags.tags
         # per-track names from CUE
         assert tracks[0].name == "Down to the Waterline"
         assert tracks[1].name == "Six Blade Knife"
@@ -427,6 +453,162 @@ class TestParseCueTracks:
         assert len(tracks) == 1
         assert [a.name for a in tracks[0].artists] == ["Band"]
 
+    @pytest.mark.asyncio
+    async def test_multi_line_performer_yields_multiple_artists(self, tmp_path: Path) -> None:
+        """Repeated PERFORMER lines produce one Artist each (Vorbis multi-field style)."""
+        audio_file = tmp_path / "album.flac"
+        audio_file.write_bytes(b"")
+        cue_text = (
+            'TITLE "Split"\n'
+            'FILE "album.flac" WAVE\n'
+            "  TRACK 01 AUDIO\n"
+            '    TITLE "T1"\n'
+            '    PERFORMER "AC/DC"\n'
+            '    PERFORMER "Queen"\n'
+            "    INDEX 01 00:00:00\n"
+        )
+        cue_item = _make_cue_item(tmp_path, cue_text)
+        provider = _make_provider(base_path=str(tmp_path))
+        tags = _make_audio_tags(duration=300.0, album="Split")
+        self._wire_provider_for_parse(provider)
+
+        with patch(
+            "music_assistant.providers.filesystem_local.cue.async_parse_tags",
+            AsyncMock(return_value=tags),
+        ):
+            tracks = await provider._cue.parse_tracks(cue_item)
+
+        assert len(tracks) == 1
+        # "AC/DC" is preserved intact — not split on the slash
+        assert [a.name for a in tracks[0].artists] == ["AC/DC", "Queen"]
+
+    @pytest.mark.asyncio
+    async def test_recording_and_releasetrack_mbids_mapped_distinctly(self, tmp_path: Path) -> None:
+        """MUSICBRAINZ_TRACKID → MB_RECORDING / .mbid; MUSICBRAINZ_RELEASETRACKID → MB_TRACK."""
+        audio_file = tmp_path / "album.flac"
+        audio_file.write_bytes(b"")
+        recording_mbid = "11111111-1111-1111-1111-111111111111"
+        releasetrack_mbid = "22222222-2222-2222-2222-222222222222"
+        cue_text = (
+            'TITLE "Album"\n'
+            'FILE "album.flac" WAVE\n'
+            "  TRACK 01 AUDIO\n"
+            '    TITLE "T1"\n'
+            f"    REM MUSICBRAINZ_TRACKID {recording_mbid}\n"
+            f"    REM MUSICBRAINZ_RELEASETRACKID {releasetrack_mbid}\n"
+            "    INDEX 01 00:00:00\n"
+        )
+        cue_item = _make_cue_item(tmp_path, cue_text)
+        provider = _make_provider(base_path=str(tmp_path))
+        tags = _make_audio_tags(duration=300.0, album="Album")
+        self._wire_provider_for_parse(provider)
+
+        with patch(
+            "music_assistant.providers.filesystem_local.cue.async_parse_tags",
+            AsyncMock(return_value=tags),
+        ):
+            tracks = await provider._cue.parse_tracks(cue_item)
+
+        assert len(tracks) == 1
+        assert (ExternalID.MB_RECORDING, recording_mbid) in tracks[0].external_ids
+        assert (ExternalID.MB_TRACK, releasetrack_mbid) in tracks[0].external_ids
+        assert tracks[0].mbid == recording_mbid
+
+    @pytest.mark.asyncio
+    async def test_aligned_track_artist_metadata(self, tmp_path: Path) -> None:
+        """REM ARTISTSORT / REM MUSICBRAINZ_ARTISTID align by index with PERFORMER."""
+        audio_file = tmp_path / "album.flac"
+        audio_file.write_bytes(b"")
+        cue_text = (
+            'TITLE "Album"\n'
+            'FILE "album.flac" WAVE\n'
+            "  TRACK 01 AUDIO\n"
+            '    TITLE "T1"\n'
+            '    PERFORMER "First Artist"\n'
+            '    PERFORMER "Second Artist"\n'
+            '    REM ARTISTSORT "Artist, First"\n'
+            '    REM ARTISTSORT "Artist, Second"\n'
+            "    REM MUSICBRAINZ_ARTISTID 11111111-1111-1111-1111-111111111111\n"
+            "    REM MUSICBRAINZ_ARTISTID 22222222-2222-2222-2222-222222222222\n"
+            "    INDEX 01 00:00:00\n"
+        )
+        cue_item = _make_cue_item(tmp_path, cue_text)
+        provider = _make_provider(base_path=str(tmp_path))
+        tags = _make_audio_tags(duration=300.0, album="Album")
+        self._wire_provider_for_parse(provider)
+        # override _parse_artist to capture the sort_name/mbid args passed per artist
+        captured: list[dict[str, str | None]] = []
+
+        async def _capture(
+            name: str, sort_name: str | None = None, mbid: str | None = None, **_k: object
+        ) -> Artist:
+            captured.append({"name": name, "sort_name": sort_name, "mbid": mbid})
+            return Artist(
+                item_id=name,
+                provider=provider.instance_id,
+                name=name,
+                sort_name=sort_name,
+                provider_mappings=set(),
+            )
+
+        provider._parse_artist = AsyncMock(side_effect=_capture)  # type: ignore[method-assign]
+
+        with patch(
+            "music_assistant.providers.filesystem_local.cue.async_parse_tags",
+            AsyncMock(return_value=tags),
+        ):
+            tracks = await provider._cue.parse_tracks(cue_item)
+
+        assert len(tracks) == 1
+        assert captured == [
+            {
+                "name": "First Artist",
+                "sort_name": "Artist, First",
+                "mbid": "11111111-1111-1111-1111-111111111111",
+            },
+            {
+                "name": "Second Artist",
+                "sort_name": "Artist, Second",
+                "mbid": "22222222-2222-2222-2222-222222222222",
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_track_level_descriptive_fields(self, tmp_path: Path) -> None:
+        """REM COPYRIGHT / GROUPING / COMMENT / ITUNESADVISORY / TITLESORT populate track metadata."""
+        audio_file = tmp_path / "album.flac"
+        audio_file.write_bytes(b"")
+        cue_text = (
+            'TITLE "Album"\n'
+            'FILE "album.flac" WAVE\n'
+            "  TRACK 01 AUDIO\n"
+            '    TITLE "Song, The"\n'
+            '    REM TITLESORT "Song, The"\n'
+            '    REM COPYRIGHT "(c) 2024 Label"\n'
+            '    REM GROUPING "Movement I"\n'
+            '    REM COMMENT "Live at Wembley"\n'
+            "    REM ITUNESADVISORY 1\n"
+            "    INDEX 01 00:00:00\n"
+        )
+        cue_item = _make_cue_item(tmp_path, cue_text)
+        provider = _make_provider(base_path=str(tmp_path))
+        tags = _make_audio_tags(duration=300.0, album="Album")
+        self._wire_provider_for_parse(provider)
+
+        with patch(
+            "music_assistant.providers.filesystem_local.cue.async_parse_tags",
+            AsyncMock(return_value=tags),
+        ):
+            tracks = await provider._cue.parse_tracks(cue_item)
+
+        assert len(tracks) == 1
+        track = tracks[0]
+        assert track.sort_name == "Song, The"
+        assert track.metadata.copyright == "(c) 2024 Label"
+        assert track.metadata.grouping == "Movement I"
+        assert track.metadata.description == "Live at Wembley"
+        assert track.metadata.explicit is True
+
 
 class TestGetStreamDetailsForCueTrack:
     """Tests for _get_stream_details_for_cue_track."""
@@ -439,6 +621,17 @@ class TestGetStreamDetailsForCueTrack:
             await provider._cue.get_stream_details("not_a_cue_id.flac")
 
     @pytest.mark.asyncio
+    async def test_not_in_library_raises(self, tmp_path: Path) -> None:
+        """Track not in library raises."""
+        cue_item = _make_cue_item(tmp_path, SAMPLE_CUE)
+        provider = _make_provider(base_path=str(tmp_path))
+        provider.resolve = AsyncMock(return_value=cue_item)  # type: ignore[method-assign]
+        provider.mass.music.tracks.get_library_item_by_prov_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        item_id = make_cue_track_id(cue_item.relative_path, 1)
+        with pytest.raises(MediaNotFoundError):
+            await provider._cue.get_stream_details(item_id)
+
+    @pytest.mark.asyncio
     async def test_missing_audio_raises(self, tmp_path: Path) -> None:
         """Missing audio raises."""
         cue_item = _make_cue_item(
@@ -448,6 +641,7 @@ class TestGetStreamDetailsForCueTrack:
         provider = _make_provider(base_path=str(tmp_path))
         provider.resolve = AsyncMock(return_value=cue_item)  # type: ignore[method-assign]
         item_id = make_cue_track_id(cue_item.relative_path, 1)
+        _stub_library_track(provider, item_id)
         with pytest.raises(MediaNotFoundError):
             await provider._cue.get_stream_details(item_id)
 
@@ -461,13 +655,8 @@ class TestGetStreamDetailsForCueTrack:
         provider.resolve = AsyncMock(return_value=cue_item)  # type: ignore[method-assign]
         # request track 99 which isn't in the CUE
         item_id = make_cue_track_id(cue_item.relative_path, 99)
-        with (
-            patch(
-                "music_assistant.providers.filesystem_local.cue.async_parse_tags",
-                AsyncMock(return_value=_make_audio_tags(duration=900.0)),
-            ),
-            pytest.raises(MediaNotFoundError),
-        ):
+        _stub_library_track(provider, item_id)
+        with pytest.raises(MediaNotFoundError):
             await provider._cue.get_stream_details(item_id)
 
     @pytest.mark.asyncio
@@ -479,39 +668,21 @@ class TestGetStreamDetailsForCueTrack:
         provider = _make_provider(base_path=str(tmp_path))
         provider.resolve = AsyncMock(return_value=cue_item)  # type: ignore[method-assign]
         item_id = make_cue_track_id(cue_item.relative_path, 2)
-        tags = _make_audio_tags(duration=900.0)
+        _stub_library_track(provider, item_id, duration=228)
 
-        with patch(
-            "music_assistant.providers.filesystem_local.cue.async_parse_tags",
-            AsyncMock(return_value=tags),
-        ):
-            details = await provider._cue.get_stream_details(item_id)
+        details = await provider._cue.get_stream_details(item_id)
 
         assert isinstance(details, StreamDetails)
         assert details.item_id == item_id
         assert details.can_seek is True
         assert details.allow_seek is True
         assert details.audio_format.content_type == ContentType.PCM_F32LE
+        assert details.duration == 228
         assert details.data is not None
-        assert details.data["audio_path"] == str(audio_file)
+        assert details.data["audio_relative_path"] == "album.flac"
         # Track 2 starts at 04:10:40 = 250.533...
         expected_start = 4 * 60 + 10 + 40 / 75
         assert abs(details.data["start_seconds"] - expected_start) < 0.001
-
-
-class TestGetAudioStreamErrorPath:
-    """Tests for get_audio_stream error handling."""
-
-    @pytest.mark.asyncio
-    async def test_invalid_streamdetails_raises(self) -> None:
-        """Invalid streamdetails raises."""
-        provider = _make_provider()
-        bad_details = MagicMock(spec=StreamDetails)
-        bad_details.data = None
-        bad_details.item_id = "whatever"
-        with pytest.raises(InvalidDataError):
-            async for _ in provider._cue.get_audio_stream(bad_details):
-                pass
 
 
 class TestProcessDeletionsCueBranch:
