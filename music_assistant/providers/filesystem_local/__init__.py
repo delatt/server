@@ -11,7 +11,7 @@ import urllib.parse
 from collections.abc import AsyncGenerator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from xml.parsers.expat import ExpatError
 
 import aiofiles
@@ -185,6 +185,11 @@ class LocalFileSystemProvider(MusicProvider):
     Optionally reads metadata from nfo files and images in folder structure <artist>/<album>.
     Supports m3u files for playlists.
     """
+
+    # concurrency for the changed-file processing step of sync_library;
+    # subclasses may lower this for transports that can't sustain 16 parallel
+    # tag-reads (e.g. WebDAV)
+    _SYNC_CONCURRENCY: ClassVar[int] = 16
 
     def __init__(
         self,
@@ -379,55 +384,27 @@ class LocalFileSystemProvider(MusicProvider):
         cur_filenames: set[str] = set()
         prev_filenames = set(file_checksums.keys())
 
-        # Phase 1: Enumerate all files in an executor thread.
-        # This is fast (just filesystem metadata) and separates unchanged files
-        # from those that need processing.
+        # Enumerate every file, separating unchanged items (just filesystem
+        # metadata) from those needing a full read/parse.
         items_to_process: list[tuple[FileSystemItem, str | None]] = []
         unchanged_cue_items: list[FileSystemItem] = []
         # absolute paths of every CUE sheet found in this scan, with the ".cue"
         # extension stripped — used for O(1) companion-CUE lookups per audio file
         cue_stems: set[str] = set()
-        ignore_album_playlists = self.media_content_type == "music" and self.config.get_value(
-            CONF_ENTRY_IGNORE_ALBUM_PLAYLISTS.key
-        )
-        # populated by recursive_iter when the provider's root base path cannot
-        # be scanned; sub-directory failures remain a silent skip as before
+        # populated when the provider's root base path cannot be scanned;
+        # sub-directory failures remain a silent skip as before
         root_scan_errors: list[OSError] = []
-
-        def enumerate_files() -> None:
-            """Enumerate all files, collecting changed items for processing."""
-            scanned = 0
-            for item in recursive_iter(
-                self.base_path,
-                self.base_path,
-                SUPPORTED_EXTENSIONS,
-                self.logger,
-                scan_errors=root_scan_errors,
-            ):
-                scanned += 1
-                if scanned % 500 == 0:
-                    update_current_task_progress_text(f"Scanning files: {scanned} found")
-                # skip playlists in album directories if configured
-                if (
-                    item.ext in PLAYLIST_EXTENSIONS
-                    and ignore_album_playlists
-                    and len(item.relative_path.split("/")) > 2
-                ):
-                    continue
-                if item.ext in CUE_EXTENSIONS and self.media_content_type == "music":
-                    cue_stems.add(item.absolute_path.rsplit(".", 1)[0])
-                prev_checksum = file_checksums.get(item.relative_path)
-                if item.checksum == prev_checksum:
-                    # unchanged, just record it as still present
-                    cur_filenames.add(item.relative_path)
-                    if item.ext in CUE_EXTENSIONS and self.media_content_type == "music":
-                        unchanged_cue_items.append(item)
-                else:
-                    items_to_process.append((item, prev_checksum))
 
         self.sync_running = True
         try:
-            await asyncio.to_thread(enumerate_files)
+            await self._enumerate_files_for_sync(
+                file_checksums=file_checksums,
+                cur_filenames=cur_filenames,
+                items_to_process=items_to_process,
+                unchanged_cue_items=unchanged_cue_items,
+                cue_stems=cue_stems,
+                root_scan_errors=root_scan_errors,
+            )
             # register synthetic track IDs for unchanged CUE files so deletion
             # reconciliation does not treat them as removed
             for cue_item in unchanged_cue_items:
@@ -447,9 +424,9 @@ class LocalFileSystemProvider(MusicProvider):
                 self.name,
             )
 
-            # Phase 2: Process changed items concurrently.
-            # Using TaskManager with a concurrency limit to avoid overwhelming
-            # the filesystem (especially important for NFS/SMB mounts).
+            # Process changed items concurrently, with a per-provider cap to
+            # avoid overwhelming the filesystem (especially important for
+            # NFS/SMB mounts and bounded by _SYNC_CONCURRENCY for WebDAV).
             processed_count = 0
 
             async def _process(item: FileSystemItem, prev_checksum: str | None) -> None:
@@ -464,7 +441,7 @@ class LocalFileSystemProvider(MusicProvider):
                         f"Processed {processed_count}/{total_items} files",
                     )
 
-            async with TaskManager(self.mass, 16) as tm:
+            async with TaskManager(self.mass, self._SYNC_CONCURRENCY) as tm:
                 for item, prev_checksum in items_to_process:
                     await tm.create_task_with_limit(_process(item, prev_checksum))
         finally:
@@ -501,6 +478,93 @@ class LocalFileSystemProvider(MusicProvider):
 
         # flag provider as available again if an earlier sync had marked it down
         self._set_available(True)
+
+    async def _enumerate_files_for_sync(
+        self,
+        *,
+        file_checksums: dict[str, str],
+        cur_filenames: set[str],
+        items_to_process: list[tuple[FileSystemItem, str | None]],
+        unchanged_cue_items: list[FileSystemItem],
+        cue_stems: set[str],
+        root_scan_errors: list[OSError],
+    ) -> None:
+        """
+        Walk every file under the provider root and fill the sync bookkeeping sets.
+
+        Called once at the start of :meth:`sync_library`. Per-file errors must
+        not raise; append to ``root_scan_errors`` only when the provider root
+        itself is unreadable (the driver aborts the sync in that case).
+
+        Each scanned file should be routed through :meth:`_classify_scan_item`,
+        which handles the "changed vs unchanged", CUE-stem, and playlist-filter
+        decisions. Override in subclasses that cannot use a local
+        ``os.scandir`` walk (e.g. WebDAV).
+        """
+        ignore_album_playlists = self.media_content_type == "music" and bool(
+            self.config.get_value(CONF_ENTRY_IGNORE_ALBUM_PLAYLISTS.key)
+        )
+
+        def _walk() -> None:
+            for scanned, item in enumerate(
+                recursive_iter(
+                    self.base_path,
+                    self.base_path,
+                    SUPPORTED_EXTENSIONS,
+                    self.logger,
+                    scan_errors=root_scan_errors,
+                ),
+                start=1,
+            ):
+                if scanned % 500 == 0:
+                    update_current_task_progress_text(f"Scanning files: {scanned} found")
+                self._classify_scan_item(
+                    item,
+                    file_checksums=file_checksums,
+                    cur_filenames=cur_filenames,
+                    items_to_process=items_to_process,
+                    unchanged_cue_items=unchanged_cue_items,
+                    cue_stems=cue_stems,
+                    ignore_album_playlists=ignore_album_playlists,
+                )
+
+        await asyncio.to_thread(_walk)
+
+    def _classify_scan_item(
+        self,
+        item: FileSystemItem,
+        *,
+        file_checksums: dict[str, str],
+        cur_filenames: set[str],
+        items_to_process: list[tuple[FileSystemItem, str | None]],
+        unchanged_cue_items: list[FileSystemItem],
+        cue_stems: set[str],
+        ignore_album_playlists: bool,
+    ) -> None:
+        """
+        Bucket a scanned file for :meth:`sync_library`.
+
+        Adds unchanged files to ``cur_filenames``, changed/new ones to
+        ``items_to_process``, records CUE stems for companion-audio skipping,
+        and filters out playlists buried in album directories when configured.
+        """
+        # skip playlists in album directories if configured
+        if (
+            item.ext in PLAYLIST_EXTENSIONS
+            and ignore_album_playlists
+            and len(item.relative_path.split("/")) > 2
+        ):
+            return
+        if item.ext in CUE_EXTENSIONS and self.media_content_type == "music":
+            cue_stems.add(item.absolute_path.rsplit(".", 1)[0])
+        prev_checksum = file_checksums.get(item.relative_path)
+        if item.checksum == prev_checksum:
+            # unchanged, just record it as still present
+            cur_filenames.add(item.relative_path)
+            if item.ext in CUE_EXTENSIONS and self.media_content_type == "music":
+                unchanged_cue_items.append(item)
+        else:
+            items_to_process.append((item, prev_checksum))
 
     def _set_available(self, available: bool) -> None:
         """Update the provider availability and notify listeners on change."""

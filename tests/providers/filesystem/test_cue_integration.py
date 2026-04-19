@@ -90,6 +90,9 @@ def _make_provider(base_path: str = "/music") -> LocalFileSystemProvider:
     provider.manifest = MagicMock(domain="filesystem_local")
     provider.logger = MagicMock()
     provider.mass = MagicMock()
+    # cache is used by load_cue_sheet; default to miss so tests exercise the parse path
+    provider.mass.cache.get = AsyncMock(return_value=None)
+    provider.mass.cache.set = AsyncMock(return_value=None)
     provider.cache = MagicMock()
     provider._sync_tracks = True
     provider._cue = CueSheetHandler(provider)

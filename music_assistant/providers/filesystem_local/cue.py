@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import (
     ContentType,
@@ -42,7 +42,7 @@ from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.helpers.tags import AudioTags, async_parse_tags
 from music_assistant.helpers.util import detect_charset
 
-from .constants import TRACK_EXTENSIONS
+from .constants import CACHE_CATEGORY_CUE_SHEETS, TRACK_EXTENSIONS
 from .helpers import FileSystemItem
 
 if TYPE_CHECKING:
@@ -77,6 +77,12 @@ def parse_cue_track_id(item_id: str) -> tuple[str, int] | None:
     return cue_path, int(track_num_str)
 
 
+def _cue_sheet_from_dict(data: dict[str, Any]) -> CueSheet:
+    """Rebuild a :class:`CueSheet` from its ``asdict`` representation."""
+    tracks = [CueTrack(**track_data) for track_data in data.get("tracks", [])]
+    return CueSheet(**{**data, "tracks": tracks})
+
+
 class CueSheetHandler:
     """CUE sheet integration bound to a :class:`LocalFileSystemProvider` instance."""
 
@@ -105,10 +111,33 @@ class CueSheetHandler:
         """
         Read and parse a CUE sheet file.
 
+        Cached by ``(relative_path, checksum)`` so unchanged CUE files skip the
+        file read entirely on subsequent syncs — important for WebDAV where a
+        re-read is an HTTP round-trip.
+
         :param cue_item: The CUE file's FileSystemItem.
         """
+        provider = self.provider
+        cached = await provider.mass.cache.get(
+            key=cue_item.relative_path,
+            provider=provider.instance_id,
+            category=CACHE_CATEGORY_CUE_SHEETS,
+            checksum=cue_item.checksum,
+            default=None,
+        )
+        if cached is not None:
+            return _cue_sheet_from_dict(cached)
         content = await self.read_cue_file(cue_item)
-        return parse_cue_sheet(content)
+        sheet = parse_cue_sheet(content)
+        await provider.mass.cache.set(
+            key=cue_item.relative_path,
+            data=asdict(sheet),
+            provider=provider.instance_id,
+            category=CACHE_CATEGORY_CUE_SHEETS,
+            checksum=cue_item.checksum,
+            expiration=3600 * 24 * 365,  # checksum invalidates; keep entries around
+        )
+        return sheet
 
     @staticmethod
     def _audio_format_from_tags(audio_path: str, tags: AudioTags) -> AudioFormat:
