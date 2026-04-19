@@ -186,9 +186,8 @@ class LocalFileSystemProvider(MusicProvider):
     Supports m3u files for playlists.
     """
 
-    # concurrency for the changed-file processing step of sync_library;
-    # subclasses may lower this for transports that can't sustain 16 parallel
-    # tag-reads (e.g. WebDAV)
+    # parallel workers for sync_library's processing step; subclasses may lower
+    # this for transports that cannot sustain 16 parallel tag reads
     _SYNC_CONCURRENCY: ClassVar[int] = 16
 
     def __init__(
@@ -384,15 +383,13 @@ class LocalFileSystemProvider(MusicProvider):
         cur_filenames: set[str] = set()
         prev_filenames = set(file_checksums.keys())
 
-        # Enumerate every file, separating unchanged items (just filesystem
-        # metadata) from those needing a full read/parse.
         items_to_process: list[tuple[FileSystemItem, str | None]] = []
         unchanged_cue_items: list[FileSystemItem] = []
-        # absolute paths of every CUE sheet found in this scan, with the ".cue"
-        # extension stripped — used for O(1) companion-CUE lookups per audio file
+        # absolute paths of every CUE sheet in this scan with the ".cue" stripped,
+        # used for O(1) companion-CUE lookups per audio file
         cue_stems: set[str] = set()
-        # populated when the provider's root base path cannot be scanned;
-        # sub-directory failures remain a silent skip as before
+        # populated only when the provider root itself is unreadable;
+        # per-subdirectory failures are logged and skipped
         root_scan_errors: list[OSError] = []
 
         self.sync_running = True
@@ -405,8 +402,8 @@ class LocalFileSystemProvider(MusicProvider):
                 cue_stems=cue_stems,
                 root_scan_errors=root_scan_errors,
             )
-            # register synthetic track IDs for unchanged CUE files so deletion
-            # reconciliation does not treat them as removed
+            # register synthetic track IDs for unchanged CUE files so the
+            # deletion pass does not treat them as removed
             for cue_item in unchanged_cue_items:
                 try:
                     cue_sheet = await self._cue.load_cue_sheet(cue_item)
@@ -424,9 +421,8 @@ class LocalFileSystemProvider(MusicProvider):
                 self.name,
             )
 
-            # Process changed items concurrently, with a per-provider cap to
-            # avoid overwhelming the filesystem (especially important for
-            # NFS/SMB mounts and bounded by _SYNC_CONCURRENCY for WebDAV).
+            # process changed items concurrently; _SYNC_CONCURRENCY caps
+            # parallelism per provider so NFS/SMB/WebDAV are not overwhelmed
             processed_count = 0
 
             async def _process(item: FileSystemItem, prev_checksum: str | None) -> None:
@@ -490,16 +486,19 @@ class LocalFileSystemProvider(MusicProvider):
         root_scan_errors: list[OSError],
     ) -> None:
         """
-        Walk every file under the provider root and fill the sync bookkeeping sets.
+        Walk every supported file under the provider root and populate the sync buckets.
 
-        Called once at the start of :meth:`sync_library`. Per-file errors must
-        not raise; append to ``root_scan_errors`` only when the provider root
-        itself is unreadable (the driver aborts the sync in that case).
+        Override in subclasses that cannot use a local ``os.scandir`` walk.
+        Implementations must route each discovered file through
+        :meth:`_classify_scan_item` and append to ``root_scan_errors`` only
+        when the provider root itself is unreadable.
 
-        Each scanned file should be routed through :meth:`_classify_scan_item`,
-        which handles the "changed vs unchanged", CUE-stem, and playlist-filter
-        decisions. Override in subclasses that cannot use a local
-        ``os.scandir`` walk (e.g. WebDAV).
+        :param file_checksums: Previously stored checksum per provider item id.
+        :param cur_filenames: Receives the ids/paths present in this scan.
+        :param items_to_process: Receives changed or new items to process.
+        :param unchanged_cue_items: Receives CUE sheets whose checksum matches.
+        :param cue_stems: Receives absolute paths (minus extension) of CUE sheets.
+        :param root_scan_errors: Receives errors that indicate the root is unreadable.
         """
         ignore_album_playlists = self.media_content_type == "music" and bool(
             self.config.get_value(CONF_ENTRY_IGNORE_ALBUM_PLAYLISTS.key)
@@ -542,11 +541,16 @@ class LocalFileSystemProvider(MusicProvider):
         ignore_album_playlists: bool,
     ) -> None:
         """
-        Bucket a scanned file for :meth:`sync_library`.
+        Route a single scanned file into the correct sync bucket.
 
-        Adds unchanged files to ``cur_filenames``, changed/new ones to
-        ``items_to_process``, records CUE stems for companion-audio skipping,
-        and filters out playlists buried in album directories when configured.
+        :param item: The file to classify.
+        :param file_checksums: Previously stored checksum per provider item id.
+        :param cur_filenames: Receives the ids/paths present in this scan.
+        :param items_to_process: Receives changed or new items to process.
+        :param unchanged_cue_items: Receives CUE sheets whose checksum matches.
+        :param cue_stems: Receives absolute paths (minus extension) of CUE sheets.
+        :param ignore_album_playlists: When True, skip playlists nested inside
+            album directories.
         """
         # skip playlists in album directories if configured
         if (

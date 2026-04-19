@@ -43,8 +43,7 @@ if TYPE_CHECKING:
 class WebDAVFileSystemProvider(LocalFileSystemProvider):
     """WebDAV File System Provider for Music Assistant."""
 
-    # WebDAV servers (especially Nextcloud/ownCloud/NAS boxes) struggle with
-    # 16 parallel tag-parse GETs; a lower cap protects shared hosts.
+    # WebDAV servers often struggle with 16 parallel tag-parse GETs
     _SYNC_CONCURRENCY = 4
 
     def __init__(
@@ -268,18 +267,11 @@ class WebDAVFileSystemProvider(LocalFileSystemProvider):
         cue_stems: set[str],
         root_scan_errors: list[OSError],
     ) -> None:
-        """
-        Walk the WebDAV tree via PROPFIND and feed the sync-library bookkeeping sets.
-
-        Overrides the base class's local ``os.scandir`` walk. Each discovered
-        file is routed through :meth:`LocalFileSystemProvider._classify_scan_item`
-        so WebDAV stays behavioural-equivalent to the local-filesystem sync
-        (including CUE-companion handling and playlist filtering).
-        """
+        """Walk the WebDAV tree via PROPFIND and populate the sync buckets."""
         ignore_album_playlists = self.media_content_type == "music" and bool(
             self.config.get_value(CONF_ENTRY_IGNORE_ALBUM_PLAYLISTS.key)
         )
-        # counter lives in a list so the nested recursion can mutate it
+        # list cell so the nested coroutine can mutate the counter
         scanned = [0]
 
         async def _walk(path: str, is_root: bool) -> None:
@@ -288,9 +280,9 @@ class WebDAVFileSystemProvider(LocalFileSystemProvider):
             except (LoginFailed, SetupFailedError, ProviderUnavailableError):
                 raise
             except aiohttp.ClientError as err:
+                # only a root-level failure aborts the sync; subdir failures
+                # are logged and skipped, matching the local-filesystem walker
                 if is_root:
-                    # mirror the recursive_iter contract: only the root failure
-                    # counts as a sync-aborting scan error
                     root_scan_errors.append(OSError(str(err)))
                 else:
                     self.logger.warning("WebDAV error scanning %s: %s", path, err)

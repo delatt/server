@@ -109,14 +109,11 @@ class CueSheetHandler:
 
     async def load_cue_sheet(self, cue_item: FileSystemItem) -> CueSheet:
         """
-        Read and parse a CUE sheet file.
-
-        Cached by ``(relative_path, checksum)`` so unchanged CUE files skip the
-        file read entirely on subsequent syncs — important for WebDAV where a
-        re-read is an HTTP round-trip.
+        Return the parsed CUE sheet for the given file.
 
         :param cue_item: The CUE file's FileSystemItem.
         """
+        # cached by (path, checksum) so unchanged CUE files skip the file read
         provider = self.provider
         cached = await provider.mass.cache.get(
             key=cue_item.relative_path,
@@ -135,7 +132,7 @@ class CueSheetHandler:
             provider=provider.instance_id,
             category=CACHE_CATEGORY_CUE_SHEETS,
             checksum=cue_item.checksum,
-            expiration=3600 * 24 * 365,  # checksum invalidates; keep entries around
+            expiration=3600 * 24 * 365,
         )
         return sheet
 
