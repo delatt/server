@@ -11,6 +11,7 @@ from music_assistant_models.errors import InvalidDataError, MediaNotFoundError
 from music_assistant_models.media_items import Album, Artist, AudioFormat, Track
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.constants import UNKNOWN_ARTIST
 from music_assistant.helpers.tags import AudioTags
 from music_assistant.providers.filesystem_local import LocalFileSystemProvider
 from music_assistant.providers.filesystem_local.cue import (
@@ -455,6 +456,34 @@ class TestParseCueTracks:
 
         assert len(tracks) == 1
         assert [a.name for a in tracks[0].artists] == ["Band"]
+
+    @pytest.mark.asyncio
+    async def test_track_artist_falls_back_to_unknown_when_no_performer(
+        self, tmp_path: Path
+    ) -> None:
+        """No PERFORMER at sheet or track level falls back to the [unknown] artist."""
+        audio_file = tmp_path / "album.flac"
+        audio_file.write_bytes(b"")
+        cue_text = (
+            'TITLE "Album"\n'
+            'FILE "album.flac" WAVE\n'
+            "  TRACK 01 AUDIO\n"
+            '    TITLE "T1"\n'
+            "    INDEX 01 00:00:00\n"
+        )
+        cue_item = _make_cue_item(tmp_path, cue_text)
+        provider = _make_provider(base_path=str(tmp_path))
+        tags = _make_audio_tags(duration=300.0, album="Album")
+        self._wire_provider_for_parse(provider)
+
+        with patch(
+            "music_assistant.providers.filesystem_local.cue.async_parse_tags",
+            AsyncMock(return_value=tags),
+        ):
+            tracks = await provider._cue.parse_tracks(cue_item)
+
+        assert len(tracks) == 1
+        assert [a.name for a in tracks[0].artists] == [UNKNOWN_ARTIST]
 
     @pytest.mark.asyncio
     async def test_multi_line_performer_yields_multiple_artists(self, tmp_path: Path) -> None:

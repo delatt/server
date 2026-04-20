@@ -37,6 +37,7 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.constants import UNKNOWN_ARTIST, UNKNOWN_ARTIST_ID_MBID
 from music_assistant.helpers.cue_sheet import CueSheet, CueTrack, parse_cue_sheet
 from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.helpers.tags import AudioTags, async_parse_tags
@@ -246,6 +247,12 @@ class CueSheetHandler:
             )
             if artist:
                 track_artists.append(artist)
+        if not track_artists:
+            # neither the track nor the sheet declared a PERFORMER; fall back to
+            # the [unknown] artist rather than leaving the track artist-less
+            unknown = await provider._parse_artist(name=UNKNOWN_ARTIST, mbid=UNKNOWN_ARTIST_ID_MBID)
+            if unknown:
+                track_artists.append(unknown)
 
         track = Track(
             item_id=track_id,
