@@ -3,8 +3,9 @@ CUE sheet parser for Music Assistant.
 
 Parses standard CUE sheet format into structured data.
 Supports the CATALOG, FILE, TRACK, INDEX, TITLE, PERFORMER, ISRC and REM
-directives; other standard directives (FLAGS, PREGAP, POSTGAP, SONGWRITER,
-CDTEXTFILE) are accepted but ignored.
+directives, plus the non-standard top-level GENRE extension. Other standard
+directives (FLAGS, PREGAP, POSTGAP, SONGWRITER, CDTEXTFILE) are accepted
+but ignored.
 """
 
 from __future__ import annotations
@@ -156,17 +157,16 @@ def parse_cue_sheet(cue_content: str) -> CueSheet:
             if current_track is not None:
                 current_track.isrcs.append(_unquote(line[5:]))
 
-        elif upper_line.startswith("GENRE "):
-            value = _unquote(line[6:])
-            if current_track is not None:
-                current_track.genres.append(value)
-            else:
-                sheet.genres.append(value)
-
         elif upper_line.startswith("CATALOG "):
             # disc-level UPC/EAN, only valid outside a TRACK block
             if current_track is None:
                 sheet.barcode = _unquote(line[8:])
+
+        elif upper_line.startswith("GENRE "):
+            # non-standard CD-Text extension (cuetools, foobar2000); same landing
+            # as REM GENRE so tools using either form produce the same result
+            target = current_track.genres if current_track is not None else sheet.genres
+            target.append(_unquote(line[6:]))
 
     return sheet
 

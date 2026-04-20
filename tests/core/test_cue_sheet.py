@@ -243,35 +243,32 @@ FILE "album.flac" WAVE
     assert track.explicit is True
 
 
-def test_plain_genre_directive() -> None:
-    """Test that bare GENRE (without REM prefix) is parsed at sheet and track level."""
+def test_parse_top_level_genre() -> None:
+    """Top-level GENRE lands in the same bucket as REM GENRE at both scopes."""
     cue = """\
-GENRE "Alternative Rock"
+GENRE "Jazz"
 TITLE "Album"
 FILE "album.flac" WAVE
   TRACK 01 AUDIO
-    TITLE "T1"
-    GENRE "Indie"
+    TITLE "Song"
+    GENRE "Fusion"
     INDEX 01 00:00:00
 """
     result = parse_cue_sheet(cue)
-    assert result.genres == ["Alternative Rock"]
-    assert result.tracks[0].genres == ["Indie"]
+    assert result.genres == ["Jazz"]
+    assert result.tracks[0].genres == ["Fusion"]
 
 
-def test_plain_genre_and_rem_genre_combine() -> None:
-    """Plain GENRE and REM GENRE should both accumulate into the genres list."""
+def test_parse_mixed_top_level_and_rem_genre() -> None:
+    """Top-level GENRE and REM GENRE both append to the same list."""
     cue = """\
 GENRE "Rock"
-REM GENRE "Pop"
+REM GENRE "Progressive"
 TITLE "Album"
 FILE "album.flac" WAVE
   TRACK 01 AUDIO
-    TITLE "T1"
-    GENRE "Folk"
-    REM GENRE "Blues"
+    TITLE "Song"
     INDEX 01 00:00:00
 """
     result = parse_cue_sheet(cue)
-    assert result.genres == ["Rock", "Pop"]
-    assert result.tracks[0].genres == ["Folk", "Blues"]
+    assert result.genres == ["Rock", "Progressive"]
