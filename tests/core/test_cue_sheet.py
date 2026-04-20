@@ -48,8 +48,8 @@ def test_parse_track_metadata() -> None:
     assert track1.title == "First Track"
     assert track1.performers == ["The Artist"]
     assert track1.isrcs == ["USRC17607839"]
-    # REM MUSICBRAINZ_TRACKID carries the recording MBID (Picard legacy naming)
-    assert track1.musicbrainz_recordingid == "d5c4a1b0-1234-5678-9abc-def012345678"
+    # REM MUSICBRAINZ_TRACKID follows Picard's %musicbrainz_trackid% (release-track MBID)
+    assert track1.musicbrainz_releasetrackid == "d5c4a1b0-1234-5678-9abc-def012345678"
 
     track2 = result.tracks[1]
     assert track2.number == 2
@@ -138,35 +138,22 @@ FILE "album.flac" WAVE
 
 
 def test_rem_lines_at_track_level() -> None:
-    """Test REM lines within track context."""
+    """REM MBIDs land in their distinct fields (Picard variable naming)."""
     cue = """\
 FILE "album.flac" WAVE
   TRACK 01 AUDIO
     TITLE "Track One"
-    REM MUSICBRAINZ_TRACKID abc-123
-    REM MUSICBRAINZ_RELEASETRACKID zzz-999
+    REM MUSICBRAINZ_TRACKID rtrk-123
+    REM MUSICBRAINZ_RECORDINGID rec-456
     ISRC GBAYE0000351
     INDEX 01 00:00:00
 """
     result = parse_cue_sheet(cue)
-    # both MUSICBRAINZ_TRACKID and MUSICBRAINZ_RECORDINGID land in recordingid
-    assert result.tracks[0].musicbrainz_recordingid == "abc-123"
-    assert result.tracks[0].musicbrainz_releasetrackid == "zzz-999"
+    # MUSICBRAINZ_TRACKID follows %musicbrainz_trackid% = release-track MBID;
+    # MUSICBRAINZ_RECORDINGID = recording MBID
+    assert result.tracks[0].musicbrainz_releasetrackid == "rtrk-123"
+    assert result.tracks[0].musicbrainz_recordingid == "rec-456"
     assert result.tracks[0].isrcs == ["GBAYE0000351"]
-
-
-def test_recordingid_alias_overrides_legacy_trackid() -> None:
-    """When both forms are present, the later line wins (same field)."""
-    cue = """\
-FILE "album.flac" WAVE
-  TRACK 01 AUDIO
-    TITLE "T1"
-    REM MUSICBRAINZ_TRACKID legacy-value
-    REM MUSICBRAINZ_RECORDINGID modern-value
-    INDEX 01 00:00:00
-"""
-    result = parse_cue_sheet(cue)
-    assert result.tracks[0].musicbrainz_recordingid == "modern-value"
 
 
 def test_multi_line_vorbis_style_fields() -> None:

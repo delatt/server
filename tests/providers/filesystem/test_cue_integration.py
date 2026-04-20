@@ -516,7 +516,7 @@ class TestParseCueTracks:
 
     @pytest.mark.asyncio
     async def test_recording_and_releasetrack_mbids_mapped_distinctly(self, tmp_path: Path) -> None:
-        """MUSICBRAINZ_TRACKID → MB_RECORDING / .mbid; MUSICBRAINZ_RELEASETRACKID → MB_TRACK."""
+        """REM MUSICBRAINZ_RECORDINGID → MB_RECORDING / .mbid; REM MUSICBRAINZ_TRACKID → MB_TRACK."""
         audio_file = tmp_path / "album.flac"
         audio_file.write_bytes(b"")
         recording_mbid = "11111111-1111-1111-1111-111111111111"
@@ -526,8 +526,8 @@ class TestParseCueTracks:
             'FILE "album.flac" WAVE\n'
             "  TRACK 01 AUDIO\n"
             '    TITLE "T1"\n'
-            f"    REM MUSICBRAINZ_TRACKID {recording_mbid}\n"
-            f"    REM MUSICBRAINZ_RELEASETRACKID {releasetrack_mbid}\n"
+            f"    REM MUSICBRAINZ_RECORDINGID {recording_mbid}\n"
+            f"    REM MUSICBRAINZ_TRACKID {releasetrack_mbid}\n"
             "    INDEX 01 00:00:00\n"
         )
         cue_item = _make_cue_item(tmp_path, cue_text)

@@ -33,11 +33,9 @@ class CueTrack:
     musicbrainz_artistids: list[str] = field(
         default_factory=list
     )  # REM MUSICBRAINZ_ARTISTID, aligned by index
-    musicbrainz_recordingid: str | None = (
-        None  # REM MUSICBRAINZ_TRACKID (legacy) / REM MUSICBRAINZ_RECORDINGID
-    )
+    musicbrainz_recordingid: str | None = None  # REM MUSICBRAINZ_RECORDINGID
     musicbrainz_releasetrackid: str | None = (
-        None  # REM MUSICBRAINZ_RELEASETRACKID (release-specific track MBID)
+        None  # REM MUSICBRAINZ_TRACKID (matches Picard's %musicbrainz_trackid%)
     )
     copyright: str | None = None  # REM COPYRIGHT
     grouping: str | None = None  # REM GROUPING
@@ -210,11 +208,10 @@ def _parse_rem_line(line: str, sheet: CueSheet, current_track: CueTrack | None) 
     # track-level (inside a TRACK block)
     if key == "GENRE":
         current_track.genres.append(value)
-    elif key in ("MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RECORDINGID"):
-        # Picard writes MUSICBRAINZ_TRACKID as the recording MBID; the modern
-        # alias is MUSICBRAINZ_RECORDINGID, both land in the same field
+    elif key == "MUSICBRAINZ_RECORDINGID":
         current_track.musicbrainz_recordingid = value
-    elif key == "MUSICBRAINZ_RELEASETRACKID":
+    elif key == "MUSICBRAINZ_TRACKID":
+        # matches Picard's %musicbrainz_trackid% variable (release-track MBID)
         current_track.musicbrainz_releasetrackid = value
     elif key == "MUSICBRAINZ_ARTISTID":
         current_track.musicbrainz_artistids.append(value)
