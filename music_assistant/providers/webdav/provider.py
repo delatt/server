@@ -160,12 +160,15 @@ class WebDAVFileSystemProvider(LocalFileSystemProvider):
     async def _scandir(self, path: str) -> list[FileSystemItem]:
         """List WebDAV directory contents with caching."""
         cache_key = f"scandir_{path}"
-        if cached := await self.cache.get(
-            key=cache_key,
-            provider=self.instance_id,
-            category=0,
-        ):
-            return [FileSystemItem(**item) for item in cached]
+        # bypass the cache during sync so edits are picked up immediately;
+        # the fresh result is still written back for subsequent browse/exists calls
+        if not self.sync_running:
+            if cached := await self.cache.get(
+                key=cache_key,
+                provider=self.instance_id,
+                category=0,
+            ):
+                return [FileSystemItem(**item) for item in cached]
 
         path = self._normalize_path(path)
         webdav_url = build_webdav_url(self.base_url, path)
@@ -261,6 +264,7 @@ class WebDAVFileSystemProvider(LocalFileSystemProvider):
         self,
         *,
         file_checksums: dict[str, str],
+        cue_file_checksums: dict[str, str],
         cur_filenames: set[str],
         items_to_process: list[tuple[FileSystemItem, str | None]],
         unchanged_cue_items: list[FileSystemItem],
@@ -271,7 +275,7 @@ class WebDAVFileSystemProvider(LocalFileSystemProvider):
         ignore_album_playlists = self.media_content_type == "music" and bool(
             self.config.get_value(CONF_ENTRY_IGNORE_ALBUM_PLAYLISTS.key)
         )
-        # list cell so the nested coroutine can mutate the counter
+        # mutable counter for the nested coroutine
         scanned = [0]
 
         async def _walk(path: str, is_root: bool) -> None:
@@ -299,6 +303,7 @@ class WebDAVFileSystemProvider(LocalFileSystemProvider):
                 self._classify_scan_item(
                     item,
                     file_checksums=file_checksums,
+                    cue_file_checksums=cue_file_checksums,
                     cur_filenames=cur_filenames,
                     items_to_process=items_to_process,
                     unchanged_cue_items=unchanged_cue_items,

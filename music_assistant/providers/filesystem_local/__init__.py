@@ -186,8 +186,7 @@ class LocalFileSystemProvider(MusicProvider):
     Supports m3u files for playlists.
     """
 
-    # parallel workers for sync_library's processing step; subclasses may lower
-    # this for transports that cannot sustain 16 parallel tag reads
+    # parallel workers per sync; subclasses lower this for slower transports
     _SYNC_CONCURRENCY: ClassVar[int] = 16
 
     def __init__(
@@ -307,7 +306,30 @@ class LocalFileSystemProvider(MusicProvider):
         item_path = path.split("://", 1)[1]
         if not item_path:
             item_path = ""
-        for item in await self._scandir(item_path):
+        scanned = await self._scandir(item_path)
+        # expand CUE sheets into per-track entries and hide the companion audio;
+        # synthetic ids match those minted during sync so get_track resolves them
+        cue_stems: set[str] = set()
+        if self.media_content_type == "music":
+            for item in scanned:
+                if item.ext not in CUE_EXTENSIONS:
+                    continue
+                cue_stems.add(item.absolute_path.rsplit(".", 1)[0])
+                try:
+                    cue_sheet = await self._cue.load_cue_sheet(item)
+                except InvalidDataError as err:
+                    self.logger.warning("Unable to parse CUE sheet %s: %s", item.relative_path, err)
+                    continue
+                for cue_track in cue_sheet.tracks:
+                    items.append(
+                        ItemMapping(
+                            media_type=MediaType.TRACK,
+                            item_id=make_cue_track_id(item.relative_path, cue_track.number),
+                            provider=self.instance_id,
+                            name=cue_track.title or f"Track {cue_track.number}",
+                        )
+                    )
+        for item in scanned:
             if not item.is_dir and ("." not in item.filename or not item.ext):
                 # skip system files and files without extension
                 continue
@@ -324,6 +346,8 @@ class LocalFileSystemProvider(MusicProvider):
                     )
                 )
             elif item.ext in TRACK_EXTENSIONS:
+                if item.absolute_path.rsplit(".", 1)[0] in cue_stems:
+                    continue
                 items.append(
                     ItemMapping(
                         media_type=MediaType.TRACK,
@@ -378,6 +402,13 @@ class LocalFileSystemProvider(MusicProvider):
         )
         for db_row in await self.mass.music.database.get_rows_from_query(query, limit=0):
             file_checksums[db_row["provider_item_id"]] = str(db_row["details"])
+        # provider_mappings stores synthetic per-track ids for CUE sheets, not the
+        # CUE path, so derive a path-keyed checksum map for the scan classifier
+        cue_file_checksums: dict[str, str] = {}
+        for prov_item_id, checksum in file_checksums.items():
+            parsed = parse_cue_track_id(prov_item_id)
+            if parsed is not None:
+                cue_file_checksums[parsed[0]] = checksum
         # find all supported files in the base directory and all subfolders
         # we work bottom up, as-in we derive all info from the tracks
         cur_filenames: set[str] = set()
@@ -396,12 +427,23 @@ class LocalFileSystemProvider(MusicProvider):
         try:
             await self._enumerate_files_for_sync(
                 file_checksums=file_checksums,
+                cue_file_checksums=cue_file_checksums,
                 cur_filenames=cur_filenames,
                 items_to_process=items_to_process,
                 unchanged_cue_items=unchanged_cue_items,
                 cue_stems=cue_stems,
                 root_scan_errors=root_scan_errors,
             )
+            # drop CUE companion audio: absorbed into CUE tracks and not tracked in
+            # provider_mappings, so they would otherwise flag as changed every sync
+            items_to_process = [
+                (item, prev)
+                for item, prev in items_to_process
+                if not (
+                    item.ext in TRACK_EXTENSIONS
+                    and item.absolute_path.rsplit(".", 1)[0] in cue_stems
+                )
+            ]
             # register synthetic track IDs for unchanged CUE files so the
             # deletion pass does not treat them as removed
             for cue_item in unchanged_cue_items:
@@ -421,8 +463,7 @@ class LocalFileSystemProvider(MusicProvider):
                 self.name,
             )
 
-            # process changed items concurrently; _SYNC_CONCURRENCY caps
-            # parallelism per provider so NFS/SMB/WebDAV are not overwhelmed
+            # _SYNC_CONCURRENCY caps parallelism per provider (NFS/SMB/WebDAV friendly)
             processed_count = 0
 
             async def _process(item: FileSystemItem, prev_checksum: str | None) -> None:
@@ -479,6 +520,7 @@ class LocalFileSystemProvider(MusicProvider):
         self,
         *,
         file_checksums: dict[str, str],
+        cue_file_checksums: dict[str, str],
         cur_filenames: set[str],
         items_to_process: list[tuple[FileSystemItem, str | None]],
         unchanged_cue_items: list[FileSystemItem],
@@ -494,6 +536,7 @@ class LocalFileSystemProvider(MusicProvider):
         when the provider root itself is unreadable.
 
         :param file_checksums: Previously stored checksum per provider item id.
+        :param cue_file_checksums: Previously stored checksum keyed by CUE relative_path.
         :param cur_filenames: Receives the ids/paths present in this scan.
         :param items_to_process: Receives changed or new items to process.
         :param unchanged_cue_items: Receives CUE sheets whose checksum matches.
@@ -520,6 +563,7 @@ class LocalFileSystemProvider(MusicProvider):
                 self._classify_scan_item(
                     item,
                     file_checksums=file_checksums,
+                    cue_file_checksums=cue_file_checksums,
                     cur_filenames=cur_filenames,
                     items_to_process=items_to_process,
                     unchanged_cue_items=unchanged_cue_items,
@@ -534,6 +578,7 @@ class LocalFileSystemProvider(MusicProvider):
         item: FileSystemItem,
         *,
         file_checksums: dict[str, str],
+        cue_file_checksums: dict[str, str],
         cur_filenames: set[str],
         items_to_process: list[tuple[FileSystemItem, str | None]],
         unchanged_cue_items: list[FileSystemItem],
@@ -545,6 +590,7 @@ class LocalFileSystemProvider(MusicProvider):
 
         :param item: The file to classify.
         :param file_checksums: Previously stored checksum per provider item id.
+        :param cue_file_checksums: Previously stored checksum keyed by CUE relative_path.
         :param cur_filenames: Receives the ids/paths present in this scan.
         :param items_to_process: Receives changed or new items to process.
         :param unchanged_cue_items: Receives CUE sheets whose checksum matches.
@@ -559,13 +605,16 @@ class LocalFileSystemProvider(MusicProvider):
             and len(item.relative_path.split("/")) > 2
         ):
             return
-        if item.ext in CUE_EXTENSIONS and self.media_content_type == "music":
+        is_cue = item.ext in CUE_EXTENSIONS and self.media_content_type == "music"
+        if is_cue:
             cue_stems.add(item.absolute_path.rsplit(".", 1)[0])
-        prev_checksum = file_checksums.get(item.relative_path)
+            prev_checksum = cue_file_checksums.get(item.relative_path)
+        else:
+            prev_checksum = file_checksums.get(item.relative_path)
         if item.checksum == prev_checksum:
             # unchanged, just record it as still present
             cur_filenames.add(item.relative_path)
-            if item.ext in CUE_EXTENSIONS and self.media_content_type == "music":
+            if is_cue:
                 unchanged_cue_items.append(item)
         else:
             items_to_process.append((item, prev_checksum))
@@ -596,7 +645,6 @@ class LocalFileSystemProvider(MusicProvider):
         try:
             self.logger.log(VERBOSE_LOG_LEVEL, "Processing: %s", item.relative_path)
 
-            # handle CUE sheet files
             if item.ext in CUE_EXTENSIONS and self.media_content_type == "music":
                 tracks = await self._cue.parse_tracks(item)
                 for track in tracks:

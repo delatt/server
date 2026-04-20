@@ -309,7 +309,7 @@ class TestParseCueTracks:
         audio_file.write_bytes(b"")
         cue_item = _make_cue_item(tmp_path, SAMPLE_CUE)
         provider = _make_provider(base_path=str(tmp_path))
-        # audio has different album+albumartist+year — CUE should override
+        # audio has different album+albumartist+year; CUE should override
         tags = _make_audio_tags(
             duration=900.0,
             album="Different Album From Tag",
@@ -332,7 +332,7 @@ class TestParseCueTracks:
         assert len(tracks) == 3
         # CUE TITLE overrode audio tag for album name
         assert tags.tags["album"] == "Live at the BBC"
-        # CUE top-level PERFORMER overrode audio albumartist (multi-value plural form —
+        # CUE top-level PERFORMER overrode audio albumartist (multi-value plural form;
         # tags.tags is typed str-valued but accepts list[str] at runtime, mirroring
         # how audio-tag parsers in helpers.tags populate it)
         assert tags.tags["albumartists"] == ["Dire Straits"]  # type: ignore[comparison-overlap]
@@ -482,7 +482,7 @@ class TestParseCueTracks:
             tracks = await provider._cue.parse_tracks(cue_item)
 
         assert len(tracks) == 1
-        # "AC/DC" is preserved intact — not split on the slash
+        # "AC/DC" is preserved intact, not split on the slash
         assert [a.name for a in tracks[0].artists] == ["AC/DC", "Queen"]
 
     @pytest.mark.asyncio
@@ -745,3 +745,91 @@ class TestGetTrackCueBranch:
         item_id = make_cue_track_id(cue_item.relative_path, 1)
         with pytest.raises(MediaNotFoundError):
             await provider.get_track(item_id)
+
+
+class TestClassifyScanItemCue:
+    """Sync-walker classification for CUE files.
+
+    Guards the edit-resync path: a CUE's previous checksum lives under synthetic
+    per-track ids in provider_mappings, never under the CUE path itself. The
+    scan reverse-derives a path-keyed map so an unchanged CUE is recognised and
+    an edited CUE forwards its prior checksum, which in turn makes the library
+    write use overwrite_existing=True.
+    """
+
+    @staticmethod
+    def _cue_item(checksum: str) -> FileSystemItem:
+        return FileSystemItem(
+            filename="album.cue",
+            relative_path="album.cue",
+            absolute_path="/music/album.cue",
+            is_dir=False,
+            checksum=checksum,
+            file_size=100,
+        )
+
+    @staticmethod
+    def _classify(
+        provider: LocalFileSystemProvider,
+        item: FileSystemItem,
+        *,
+        cue_file_checksums: dict[str, str] | None = None,
+    ) -> tuple[
+        list[tuple[FileSystemItem, str | None]],
+        list[FileSystemItem],
+        set[str],
+        set[str],
+    ]:
+        items_to_process: list[tuple[FileSystemItem, str | None]] = []
+        unchanged_cue_items: list[FileSystemItem] = []
+        cur_filenames: set[str] = set()
+        cue_stems: set[str] = set()
+        provider._classify_scan_item(
+            item,
+            file_checksums={},
+            cue_file_checksums=cue_file_checksums or {},
+            cur_filenames=cur_filenames,
+            items_to_process=items_to_process,
+            unchanged_cue_items=unchanged_cue_items,
+            cue_stems=cue_stems,
+            ignore_album_playlists=False,
+        )
+        return items_to_process, unchanged_cue_items, cur_filenames, cue_stems
+
+    def test_unchanged_cue_routes_to_unchanged_bucket(self) -> None:
+        """Matching checksum: CUE is marked present and not re-processed."""
+        provider = _make_provider()
+        cue_item = self._cue_item("checksum-v1")
+        items, unchanged, cur, stems = self._classify(
+            provider,
+            cue_item,
+            cue_file_checksums={"album.cue": "checksum-v1"},
+        )
+        assert items == []
+        assert unchanged == [cue_item]
+        assert cur == {"album.cue"}
+        assert stems == {"/music/album"}
+
+    def test_edited_cue_forwards_prior_checksum(self) -> None:
+        """Changed checksum: prior value is forwarded so downstream overwrite=True."""
+        provider = _make_provider()
+        cue_item = self._cue_item("checksum-v2")
+        items, unchanged, _, _ = self._classify(
+            provider,
+            cue_item,
+            cue_file_checksums={"album.cue": "checksum-v1"},
+        )
+        assert items == [(cue_item, "checksum-v1")]
+        assert unchanged == []
+
+    def test_new_cue_has_no_prior_checksum(self) -> None:
+        """First-time ingest: prev_checksum is None, item queued for processing."""
+        provider = _make_provider()
+        cue_item = self._cue_item("checksum-v1")
+        items, unchanged, _, _ = self._classify(
+            provider,
+            cue_item,
+            cue_file_checksums={},
+        )
+        assert items == [(cue_item, None)]
+        assert unchanged == []

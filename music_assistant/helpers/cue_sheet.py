@@ -147,7 +147,7 @@ def parse_cue_sheet(cue_content: str) -> CueSheet:
         elif upper_line.startswith("INDEX "):
             if current_track is None:
                 continue
-            # INDEX 01 MM:SS:FF — use INDEX 01 as track start
+            # INDEX 01 MM:SS:FF, use INDEX 01 as track start
             match = re.match(r"INDEX\s+(\d+)\s+(\d+:\d+:\d+)", line, re.IGNORECASE)
             if match and match.group(1) == "01":
                 current_track.start_position = _parse_timestamp(match.group(2))
@@ -157,7 +157,7 @@ def parse_cue_sheet(cue_content: str) -> CueSheet:
                 current_track.isrcs.append(_unquote(line[5:]))
 
         elif upper_line.startswith("CATALOG "):
-            # disc-level UPC/EAN — only valid outside a TRACK block
+            # disc-level UPC/EAN, only valid outside a TRACK block
             if current_track is None:
                 sheet.barcode = _unquote(line[8:])
 
@@ -172,7 +172,7 @@ def _parse_rem_line(line: str, sheet: CueSheet, current_track: CueTrack | None) 
     :param sheet: The CueSheet being built.
     :param current_track: The current track context, if any.
     """
-    # REM KEY VALUE — split into at most 3 parts
+    # REM KEY VALUE, split into at most 3 parts
     parts = line.split(None, 2)
     if len(parts) < 3:
         return
@@ -180,7 +180,7 @@ def _parse_rem_line(line: str, sheet: CueSheet, current_track: CueTrack | None) 
     key = parts[1].upper()
     value = _unquote(parts[2])
 
-    # sheet-level (applies with or without a current track; written outside TRACK blocks)
+    # sheet-level directives (written outside any TRACK block)
     if current_track is None:
         if key == "DATE":
             sheet.date = value
@@ -205,7 +205,7 @@ def _parse_rem_line(line: str, sheet: CueSheet, current_track: CueTrack | None) 
         current_track.genres.append(value)
     elif key in ("MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RECORDINGID"):
         # Picard writes MUSICBRAINZ_TRACKID as the recording MBID; the modern
-        # alias is MUSICBRAINZ_RECORDINGID — both land in the same field
+        # alias is MUSICBRAINZ_RECORDINGID, both land in the same field
         current_track.musicbrainz_recordingid = value
     elif key == "MUSICBRAINZ_RELEASETRACKID":
         current_track.musicbrainz_releasetrackid = value

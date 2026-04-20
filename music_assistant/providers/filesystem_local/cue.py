@@ -101,8 +101,8 @@ class CueSheetHandler:
 
         :param cue_item: The CUE file's FileSystemItem.
         """
-        # route through provider._read_file so WebDAV (and any future non-mounted
-        # filesystem provider) uses its own transport instead of aiofiles
+        # route through provider._read_file so non-mounted providers (WebDAV)
+        # use their own transport instead of aiofiles
         raw = await self.provider._read_file(cue_item.relative_path)
         encoding = await detect_charset(raw)
         return raw.decode(encoding, errors="replace")
@@ -191,9 +191,9 @@ class CueSheetHandler:
         if cue_sheet.sort_title:
             tags.tags["albumsort"] = cue_sheet.sort_title
         if cue_sheet.performers:
-            # use the plural form so AudioTags.album_artists picks up every value —
-            # tags.tags is typed str-valued but holds list[str] for Vorbis-style multi
-            # (see how parse helpers populate it in music_assistant.helpers.tags)
+            # plural form so AudioTags.album_artists sees every value; tags.tags is
+            # typed dict[str, str] but accepts list[str] at runtime for Vorbis multi.
+            # TODO: remove the type: ignore once AudioTags.tags is retyped upstream.
             tags.tags.pop("albumartist", None)
             tags.tags["albumartists"] = list(cue_sheet.performers)  # type: ignore[assignment]
         if cue_sheet.album_artist_sort_names:
@@ -226,10 +226,8 @@ class CueSheetHandler:
         provider = self.provider
         track_id = make_cue_track_id(cue_item.relative_path, cue_track.number)
 
-        # track artist(s): per-track PERFORMER wins, falling back to sheet-level PERFORMER.
-        # Multi-artist is expressed as multiple PERFORMER lines (Vorbis convention) —
-        # we deliberately do not split a single PERFORMER value on delimiters since band
-        # names like "AC/DC" would be mangled.
+        # per-track PERFORMER wins over sheet-level. Multi-artist uses one PERFORMER
+        # line per artist (Vorbis convention); never delimiter-split, would mangle "AC/DC".
         performer_names = cue_track.performers or list(ctx.album_performers)
         track_artists: UniqueList[Artist | ItemMapping] = UniqueList()
         for idx, artist_name in enumerate(performer_names):
@@ -418,7 +416,7 @@ class CueSheetHandler:
         prov_mapping = next(x for x in library_track.provider_mappings if x.item_id == item_id)
         original_format = prov_mapping.audio_format
 
-        # the CUE parse only gives us the track's start offset and the audio filename
+        # re-parse to read the track's start offset
         cue_item = await provider.resolve(cue_path)
         cue_sheet = await self.load_cue_sheet(cue_item)
         cue_track = next((t for t in cue_sheet.tracks if t.number == track_number), None)
@@ -431,20 +429,18 @@ class CueSheetHandler:
             msg = f"Audio file not found for CUE sheet: {cue_path}"
             raise MediaNotFoundError(msg)
 
-        # StreamType.CUSTOM is required here: a CUE track is a segment of a larger
-        # file and needs -ss/-t applied relative to the track's base offset. Core
-        # appends its own -ss for user seeks after streamdetails.extra_input_args,
-        # and a second input -ss overrides the first — so LOCAL_FILE with a base
-        # offset cannot coexist with user seeking under the current core API.
+        # CUE tracks need StreamType.CUSTOM: they are a segment of a larger file and
+        # require -ss/-t at the track offset. Core appends its own -ss for user seeks
+        # after extra_input_args, and a second input -ss overrides the first, so
+        # LOCAL_FILE with a base offset cannot coexist with user seeking.
         output_format = AudioFormat(
             content_type=ContentType.PCM_F32LE,
             sample_rate=original_format.sample_rate,
             bit_depth=32,
             channels=original_format.channels,
         )
-        # store the relative path so get_audio_stream can re-resolve at stream time —
-        # this keeps WebDAV's authenticated URLs fresh and avoids leaking credentials
-        # into persisted StreamDetails
+        # store the relative path so get_audio_stream re-resolves at stream time;
+        # keeps WebDAV auth fresh and keeps credentials out of persisted StreamDetails
         return StreamDetails(
             provider=provider.instance_id,
             item_id=item_id,
@@ -470,8 +466,7 @@ class CueSheetHandler:
         :param streamdetails: Streamdetails previously built by :meth:`get_stream_details`.
         :param seek_position: Position (seconds) within the track to start from.
         """
-        # streamdetails here was built by get_stream_details above, so data and
-        # duration are guaranteed populated — the assertions exist to narrow types
+        # streamdetails was built by get_stream_details; asserts narrow for mypy
         assert streamdetails.data is not None
         assert streamdetails.duration is not None
         audio_relative_path: str = streamdetails.data["audio_relative_path"]
