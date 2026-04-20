@@ -241,3 +241,37 @@ FILE "album.flac" WAVE
     assert track.grouping == "Movement I"
     assert track.comment == "Live at Wembley"
     assert track.explicit is True
+
+
+def test_plain_genre_directive() -> None:
+    """Test that bare GENRE (without REM prefix) is parsed at sheet and track level."""
+    cue = """\
+GENRE "Alternative Rock"
+TITLE "Album"
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "T1"
+    GENRE "Indie"
+    INDEX 01 00:00:00
+"""
+    result = parse_cue_sheet(cue)
+    assert result.genres == ["Alternative Rock"]
+    assert result.tracks[0].genres == ["Indie"]
+
+
+def test_plain_genre_and_rem_genre_combine() -> None:
+    """Plain GENRE and REM GENRE should both accumulate into the genres list."""
+    cue = """\
+GENRE "Rock"
+REM GENRE "Pop"
+TITLE "Album"
+FILE "album.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "T1"
+    GENRE "Folk"
+    REM GENRE "Blues"
+    INDEX 01 00:00:00
+"""
+    result = parse_cue_sheet(cue)
+    assert result.genres == ["Rock", "Pop"]
+    assert result.tracks[0].genres == ["Folk", "Blues"]

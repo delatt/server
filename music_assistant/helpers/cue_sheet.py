@@ -156,6 +156,13 @@ def parse_cue_sheet(cue_content: str) -> CueSheet:
             if current_track is not None:
                 current_track.isrcs.append(_unquote(line[5:]))
 
+        elif upper_line.startswith("GENRE "):
+            value = _unquote(line[6:])
+            if current_track is not None:
+                current_track.genres.append(value)
+            else:
+                sheet.genres.append(value)
+
         elif upper_line.startswith("CATALOG "):
             # disc-level UPC/EAN, only valid outside a TRACK block
             if current_track is None:
